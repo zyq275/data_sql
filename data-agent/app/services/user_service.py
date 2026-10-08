@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import BusinessRuleError, NotFoundError, ValidationError
+from app.core.exceptions import NotFoundError, PermissionDeniedError, ValidationError
 from app.core.response import PageData
 from app.core.security import hash_password
 from app.models import User
@@ -52,19 +52,19 @@ class UserService:
         return UserOut.model_validate(user)
 
     async def update_role(self, operator: User, user_id: str, role: str) -> UserOut:
-        """修改他人角色（FR-ADMIN-003）；管理员不得修改本人（BR-AUTH-003）。"""
+        """修改他人角色（FR-ADMIN-003）；管理员不得修改本人（BR-AUTH-003）→ 403。"""
         target = await self._get_target(user_id)
         if target.id == operator.id:
-            raise BusinessRuleError("管理员不能修改自己的角色")
+            raise PermissionDeniedError("管理员不能修改自己的角色")
         await self.users.update_role(target, role)
         await self.session.commit()
         return UserOut.model_validate(target)
 
     async def update_status(self, operator: User, user_id: str, is_active: bool) -> UserOut:
-        """启用/禁用他人（FR-ADMIN-004）；管理员不得禁用本人（BR-AUTH-003）。"""
+        """启用/禁用他人（FR-ADMIN-004）；管理员不得禁用本人（BR-AUTH-003）→ 403。"""
         target = await self._get_target(user_id)
         if target.id == operator.id:
-            raise BusinessRuleError("管理员不能修改自己的启用状态")
+            raise PermissionDeniedError("管理员不能修改自己的启用状态")
         await self.users.update_status(target, is_active)
         await self.session.commit()
         return UserOut.model_validate(target)

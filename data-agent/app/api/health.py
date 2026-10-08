@@ -8,7 +8,6 @@ from app.core.config import get_settings
 
 router = APIRouter(tags=["system"])
 
-
 @router.get("/health", summary="存活探针")
 async def health() -> dict:
     """进程存活即返回 200，不探测外部依赖。"""

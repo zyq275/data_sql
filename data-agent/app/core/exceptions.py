@@ -40,13 +40,6 @@ class ValidationError(AppException):
     message = "参数校验失败"
 
 
-class BusinessRuleError(ValidationError):
-    """业务规则不满足（如「管理员不得修改本人」BR-AUTH-003）。
-
-    与参数格式无关，但同属调用方输入问题，故沿用 40000/400，便于前端统一提示。
-    """
-
-
 # ---- 401xx 认证 ----
 
 
@@ -76,7 +69,15 @@ class InvalidTokenError(AuthError):
 
 
 class PermissionDeniedError(AppException):
-    """已认证但权限不足，或账号被禁用（FR-AUTH-001、FR-AUTH-005）。"""
+    """已认证但操作被拒。
+
+    三种情形共用 403/40300：
+
+    - 角色不足（FR-AUTH-005，如 viewer 访问 admin 接口）；
+    - 对自身执行被禁止的操作（BR-AUTH-003，管理员不得修改或禁用本人）——
+      语义上是「该主体无权对自身施加此操作」，而非入参有误，故不归入 400xx；
+    - 账号被禁用（FR-AUTH-001）。
+    """
 
     code = 40300
     http_status = 403
