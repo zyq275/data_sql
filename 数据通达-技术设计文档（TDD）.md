@@ -75,7 +75,7 @@
 | 全文检索 | Elasticsearch | 8.x | ik 中文分词 |
 | 缓存/会话 | Redis | ≥5.0 | checkpointer + 缓存 |
 | 配置 | pydantic-settings | ≥2.0 | 类型安全、环境变量注入 |
-| 认证 | PyJWT + passlib(bcrypt) | — | 标准 JWT + 哈希 |
+| 认证 | PyJWT + bcrypt | — | 标准 JWT + 哈希（直连 bcrypt，不经 passlib，见 §13 说明） |
 | 日志 | loguru | ≥0.7 | 结构化、可 patch request_id |
 | 可观测 | OpenTelemetry + Langfuse | — | 链路追踪 + LLM 追踪 |
 | 测试 | pytest | — | 单测 + 评测 |
@@ -658,6 +658,8 @@ CREATE TABLE eval_run (
 | Prompt 注入 | 提示词约束"仅使用提供的表/字段"，隔离用户输入 |
 | 令牌滥用 | 访问/刷新令牌分离、短期过期、类型校验 |
 | 慢查询 | max_execution_time + max_result_rows 双重限制 |
+
+> **密码哈希为何不用 passlib**：passlib 最新版仍停留在 1.7.4（2020 年，已停止维护），其 bcrypt 后端在初始化自检阶段即调用 `hashpw` 探测历史 wrap bug，而 bcrypt 4.1+ 对超 72 字节输入改为抛 `ValueError`，导致 `CryptContext(schemes=["bcrypt"])` 在 bcrypt 5.x 下直接构造失败。因此改为直连 `bcrypt` 库的 `hashpw` / `checkpw`；产物仍是标准 `$2b$` 哈希，与 passlib 历史数据可互通，后续如需迁移到 argon2 也只需替换 core.security 内两个函数。
 
 ---
 

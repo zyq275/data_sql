@@ -16,15 +16,25 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "asyncmy>=0.2.9",
     "alembic>=1.14",
+    # 认证（阶段 3）
+    "pyjwt>=2.9",
+    "bcrypt>=4.1",
 ]
 
 # 以下依赖按开发阶段逐步启用（见《开发步骤文档》），避免阶段 1 引入未使用的重依赖：
-#   阶段 3  认证        : pyjwt, passlib[bcrypt]
 #   阶段 4  知识库构建  : qdrant-client, elasticsearch[async], httpx
 #   阶段 5  Agent 闭环  : langgraph>=1.0, langchain>=1.2, langchain-openai
 #   阶段 6  混合检索    : redis[hiredis]
 #   阶段 11 可观测      : loguru, opentelemetry-sdk, opentelemetry-instrumentation-fastapi, langfuse
-#   测试                : pytest, pytest-asyncio, httpx
+
+[project.optional-dependencies]
+# 开发/验收用：uv pip install -e ".[dev]"
+# httpx 在阶段 3 已用于接口验收（ASGI transport，无需起服务）
+dev = [
+    "httpx>=0.27",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
 
 [build-system]
 requires = ["hatchling"]
