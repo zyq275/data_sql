@@ -14,7 +14,10 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.core.config import get_settings
-from app.models.base import Base
+
+# 从 app.models 包导入会触发 __init__ 集中登记全部模型，
+# autogenerate 才能看到 11 张表（只导入 base 会导致漏表）
+from app.models import Base
 
 config = context.config
 
