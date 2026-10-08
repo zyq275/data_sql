@@ -91,23 +91,39 @@ class JWTSettings(BaseModel):
 
 
 class QdrantSettings(BaseModel):
-    """向量库（字段/指标两路召回）。"""
+    """向量库（字段/指标两路召回）。
 
+    mode=server 时连远程 Qdrant（host/port）；mode=local 时用 qdrant-client 自带的
+    嵌入式引擎，数据落在 local_path，不开独立进程。两种模式走同一套 API，
+    业务代码不感知差异，本地开发与容器部署可以只靠配置切换。
+    """
+
+    mode: str = "server"
     host: str = "127.0.0.1"
     port: int = 6333
+    local_path: str = ""
     embedding_size: int = 1024
     column_collection: str = "data-agent-column"
     metric_collection: str = "data-agent-metric"
+
+    @property
+    def is_local(self) -> bool:
+        return self.mode == "local"
 
 
 class ElasticsearchSettings(BaseModel):
     """全文检索（取值召回）。"""
 
+    scheme: str = "http"
     host: str = "127.0.0.1"
     port: int = 9200
     index_name: str = "data-agent-value"
     username: str = ""
     password: str = ""
+
+    @property
+    def url(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
 
 
 class RedisSettings(BaseModel):

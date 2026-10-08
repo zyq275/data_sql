@@ -3,12 +3,16 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 3 认证与用户管理**。
+当前进度：**阶段 4 知识库构建**。
 
 ## 环境要求
 
 - Python ≥ 3.12
-- MySQL 8.x（meta 库；阶段 4 起还需要 Qdrant / Elasticsearch / Redis）
+- MySQL 8.x（meta 库 + dw 库）
+- 阶段 4 起还需要：
+  - **Qdrant** —— 或用 `qdrant.mode=local` 走嵌入式模式（见下）
+  - **Elasticsearch 8.x + analysis-ik 插件** —— 版本必须完全一致
+  - **Embedding HTTP 服务** —— 本项目用 Ollama 提供 bge-m3（ADR-005：不在应用内做本地推理）
 - Node ≥ 20（前端独立目录 `../data-agent-frontend`）
 
 ## 首次准备
@@ -89,6 +93,102 @@ CREATE DATABASE IF NOT EXISTS data_agent_meta
 40400 资源、50000 服务），HTTP 状态码按类别同步返回。`/health` 与 `/health/ready`
 是探针，按约定返回裸结构、不套信封。
 
+## 验证清单（阶段 4 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 表/字段/指标完整入库 | `build_meta` 末尾的入库自检（核对"配置声明"与"实际入库"行数，不一致直接失败） |
+| 字段与指标向量索引建立 | 查 `data-agent-column` / `data-agent-metric` 两个集合的点数是否为字段数 / 指标数 |
+| 字段取值全文索引建立 | 查 `data-agent-value` 文档数；`POST /_analyze` 确认 ik 分词生效 |
+| 召回能命中对应项 | 对"订单金额""会员等级"等问法做向量检索，看 top-1 是否为对应字段 |
+
+召回这一条的口径是**召回@k，不是 top-1 精度**：阶段 4 交付的是索引，能保证正确项
+进入候选集；单路稠密向量分不开近义词（实测"销售额"会被排到"销量"之前），
+精排由阶段 6 的 RRF + rerank 负责，详见 TDD 8.3 的"已知限制"。
+
+## 元数据知识库构建（阶段 4）
+
+知识库由 `conf/meta_config.yaml` 声明，改配置即可扩展，不改代码（NFR-MAINT-001）。
+
+### 1. 建数仓库与样例数据
+
+先建 dw 库和只读账号（口令从环境变量读，不要写进命令行参数）：
+
+```bash
+DW_READONLY_PASSWORD='<自定口令>' .venv/Scripts/python.exe -m app.scripts.seed_dw --create-account
+.venv/Scripts/python.exe -m app.scripts.seed_dw        # 建库建表 + 造样例数据
+```
+
+`--create-account` 建出 `DB_DW__USER` 指定的账号，**只授 SELECT**（ADR-008 /
+NFR-SEC-007：写操作在机制上不可能发生）。记得把口令填进 `.env` 的 `DB_DW__PASSWORD`。
+
+样例数据用固定随机种子生成，日期区间截至运行当天，保证"去年""近三个月"这类
+相对时间问法有数据可查。
+
+### 2. 准备三个外部服务
+
+**Embedding（必须）** —— Ollama 起 bge-m3，并让 `.env` 的 `EMBEDDING__HOST`
+指向其 OpenAI 兼容根路径：
+
+```bash
+OLLAMA_HOST=127.0.0.1:11435 OLLAMA_MODELS='D:\agent\ollama-models' ollama serve &
+OLLAMA_HOST=127.0.0.1:11435 ollama pull bge-m3
+curl -s http://127.0.0.1:11435/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"bge-m3","input":["测试"]}' | head -c 120
+```
+
+**Elasticsearch + ik（必须）** —— ik 插件版本必须与 ES 完全一致，否则插件加载失败。
+TDD 只限定"Elasticsearch 8.x"，本项目实测使用 **8.9.2**（国内镜像的 8.x 线止于
+8.9.2，官网直连下载约 43KB/s，华为云镜像约 7.6MB/s 且 sha512 与官网一致）：
+
+```bash
+# 国内可用镜像：https://mirrors.huaweicloud.com/elasticsearch/8.9.2/elasticsearch-8.9.2-windows-x86_64.zip
+unzip elasticsearch-8.9.2-windows-x86_64.zip
+# ik 从 infinilabs 的发布站取对应版本（GitHub release 常连不上）
+unzip analysis-ik-8.9.2.zip -d elasticsearch-8.9.2/plugins/analysis-ik
+elasticsearch-8.9.2/bin/elasticsearch-plugin install -b file:///<绝对路径>/analysis-ik-8.9.2.zip
+elasticsearch-8.9.2/bin/elasticsearch.bat
+```
+
+`-b` 是必需的：ik 会申请 `SocketPermission * connect,resolve`（远程词典功能），
+不加会停在 `Continue with installation? [y/N]` 等输入。
+装完用 `GET /_cat/plugins` 确认列出 `analysis-ik`。
+
+开发机还要**限制堆内存**——默认自动堆会按物理内存算到 ~7.8GB，很容易把
+提交内存吃穿（见下面"内存与页面文件"）。在 `config/jvm.options.d/heap.options` 写：
+
+```
+-Xms1g
+-Xmx1g
+```
+
+未装 ik 时构建脚本会显式报错，不会静默退回内置分词器（中文用 standard 分词
+基本等于单字匹配，降级会让召回质量悄悄变差）。
+
+**Qdrant（可选）** —— 没有 Qdrant 服务时，在 `.env` 里切到嵌入式模式：
+
+```
+QDRANT__MODE=local
+QDRANT__LOCAL_PATH=D:\agent\infra\qdrant-local-data
+```
+
+嵌入式模式与 server 模式 API 一致，业务代码不感知差异；区别只是 payload 索引
+不生效（只影响按字段过滤的性能，过滤语义不变），且数据落在本地目录。
+
+### 3. 构建
+
+```bash
+.venv/Scripts/python.exe -m app.scripts.build_meta                  # 全量重建 MySQL + Qdrant + ES
+.venv/Scripts/python.exe -m app.scripts.build_meta --no-value-index # 只重建 MySQL + Qdrant
+.venv/Scripts/python.exe -m app.scripts.build_meta --embed-only     # 配置没变，只重建向量
+```
+
+构建是**全量重建**：先清空四张知识表与两个集合、索引再写入。MySQL 主键由
+`uuid5(命名空间, 自然键)` 确定性生成，Qdrant 点 id 与 ES 文档 id 直接复用同一个
+id，因此重建后 id 不变（`permission.resource_id` 不会失效），也不会产生副本。
+
+结束后会做入库自检——核对"配置声明"与"实际入库"的行数，不一致直接失败。
+
 ## 目录结构
 
 ```
@@ -132,3 +232,16 @@ data-agent/
   后端在自检阶段会喂超 72 字节输入给 `hashpw`，与 bcrypt 4.1+ 的严格校验冲突，
   `CryptContext(schemes=["bcrypt"])` 直接构造失败。因此 `app/core/security.py`
   直连 `bcrypt` 的 `hashpw`/`checkpw`，产物仍是标准 `$2b$` 哈希。
+- **MySQL 8 的 `caching_sha2_password` 需要 `cryptography`**：服务端认证缓存失效时
+  （MySQL 重启、`FLUSH PRIVILEGES`），客户端必须做 RSA 公钥加密，asyncmy 依赖
+  `cryptography` 提供该能力，缺失则报 `RuntimeError: 'cryptography' package is required`，
+  表现为"昨天还能连、今天连不上"。`pyproject.toml` 已显式声明该依赖。
+  另外 `CREATE USER`/`GRANT` 是即时生效的 DDL，**不要**在其后 `FLUSH PRIVILEGES`——
+  没有意义，只会清空认证缓存，把紧接着的下一步连接打挂。
+- **内存与页面文件**：ES 默认要 ~1GB 堆，bge-m3 权重 1.07GiB，两者都需要提交内存。
+  若 C 盘空间枯竭导致页面文件无法扩张，Windows 提交上限会被卡死，表现为
+  `failed to allocate buffer` / `GGML_ASSERT(ctx->mem_buffer != NULL) failed`
+  这类**看起来像模型损坏、实则是内存不足**的报错。排查先看提交内存而不是模型。
+- **Ollama 用独立实例**：项目在 11435 端口另起一个实例（`OLLAMA_MODELS` 指向项目
+  目录），与用户已有的 11434 实例互不影响。好处是模型存储位置可控、不受个人实例
+  的模型增删影响。

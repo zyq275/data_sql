@@ -71,8 +71,8 @@
 | 嵌入模型 | bge-m3（独立服务） | — | 多语言、语义强 |
 | ORM | SQLAlchemy 2.0（async）+ Alembic | ≥2.0 | 异步 + 数据库迁移 |
 | MySQL 驱动 | asyncmy | ≥0.2 | 异步驱动 |
-| 向量库 | Qdrant | ≥1.16 | 独立部署、相似度检索 |
-| 全文检索 | Elasticsearch | 8.x | ik 中文分词 |
+| 向量库 | Qdrant | ≥1.16 | 独立部署、相似度检索（开发可用 qdrant-client 嵌入式模式，见 §11） |
+| 全文检索 | Elasticsearch | 8.x | ik 中文分词（索引期 ik_max_word / 检索期 ik_smart） |
 | 缓存/会话 | Redis | ≥5.0 | checkpointer + 缓存 |
 | 配置 | pydantic-settings | ≥2.0 | 类型安全、环境变量注入 |
 | 认证 | PyJWT + bcrypt | — | 标准 JWT + 哈希（直连 bcrypt，不经 passlib，见 §13 说明） |
@@ -552,6 +552,72 @@ CREATE TABLE eval_run (
 | dim_date | date_id, year, quarter, month, day |
 | fact_order | order_id, customer_id, product_id, date_id, region_id, order_quantity, order_amount |
 
+> 说明：上表为**关键字段**，实际 DDL 见下方。`fact_order` 额外含 `order_status`
+> （已支付/已取消/已退款）——指标口径（如 GMV 排除已取消订单）需要它才能表达，
+> 否则 BR-META-002 的"严格遵循口径"无法落地。
+
+建表与样例数据由 `app/scripts/seed_dw.py` 生成（`python -m app.scripts.seed_dw`），
+表结构必须与 `conf/meta_config.yaml` 的声明一致：
+
+```sql
+CREATE TABLE dim_region (
+    region_id   INT         NOT NULL COMMENT '地区主键',
+    province    VARCHAR(32) NOT NULL COMMENT '省份名称',
+    region_name VARCHAR(32) NOT NULL COMMENT '大区名称',
+    country     VARCHAR(32) NOT NULL DEFAULT '中国',
+    PRIMARY KEY (region_id), KEY idx_region_name (region_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE dim_customer (
+    customer_id   INT         NOT NULL COMMENT '客户主键',
+    customer_name VARCHAR(64) NOT NULL COMMENT '客户姓名',
+    gender        VARCHAR(8)  NULL COMMENT '性别：男/女',
+    member_level  VARCHAR(16) NULL COMMENT '会员等级：普通/银卡/金卡/钻石',
+    PRIMARY KEY (customer_id), KEY idx_member_level (member_level)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE dim_product (
+    product_id   INT          NOT NULL COMMENT '商品主键',
+    product_name VARCHAR(128) NOT NULL COMMENT '商品名称',
+    category     VARCHAR(64)  NULL COMMENT '一级类目',
+    brand        VARCHAR(64)  NULL COMMENT '品牌',
+    PRIMARY KEY (product_id), KEY idx_category (category)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- year / month / day 是 MySQL 保留字，必须加反引号
+CREATE TABLE dim_date (
+    date_id INT NOT NULL COMMENT '日期主键，格式 yyyymmdd',
+    `year`  INT NOT NULL COMMENT '自然年',
+    quarter INT NOT NULL COMMENT '自然季度 1-4',
+    `month` INT NOT NULL COMMENT '自然月 1-12',
+    `day`   INT NOT NULL COMMENT '月内第几天',
+    PRIMARY KEY (date_id), KEY idx_year_month (`year`, `month`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE fact_order (
+    order_id       BIGINT        NOT NULL COMMENT '订单主键',
+    customer_id    INT           NOT NULL COMMENT '客户ID -> dim_customer',
+    product_id     INT           NOT NULL COMMENT '商品ID -> dim_product',
+    date_id        INT           NOT NULL COMMENT '下单日期 -> dim_date',
+    region_id      INT           NOT NULL COMMENT '地区ID -> dim_region',
+    order_quantity INT           NOT NULL COMMENT '购买件数',
+    order_amount   DECIMAL(18,2) NOT NULL COMMENT '订单金额（元，不含运费）',
+    order_status   VARCHAR(16)   NOT NULL COMMENT '订单状态：已支付/已取消/已退款',
+    PRIMARY KEY (order_id),
+    KEY idx_customer_id (customer_id), KEY idx_product_id (product_id),
+    KEY idx_date_id (date_id), KEY idx_region_id (region_id),
+    KEY idx_order_status (order_status),
+    CONSTRAINT fk_order_customer FOREIGN KEY (customer_id) REFERENCES dim_customer (customer_id),
+    CONSTRAINT fk_order_product  FOREIGN KEY (product_id)  REFERENCES dim_product (product_id),
+    CONSTRAINT fk_order_date     FOREIGN KEY (date_id)     REFERENCES dim_date (date_id),
+    CONSTRAINT fk_order_region   FOREIGN KEY (region_id)   REFERENCES dim_region (region_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+样例数据规模：28 个地区 / 60 个客户 / 20 个商品 / 1024 个日期（2024-01-01 起）/
+约 4000 笔订单。日期区间截至**运行当天**而非硬编码，保证"去年""近三个月"这类
+相对时间问法始终有数据可查；随机种子固定，同一份数据可复现。
+
 ### 8.3 向量库与全文索引
 
 | 存储 | 集合/索引 | 内容 |
@@ -559,6 +625,36 @@ CREATE TABLE eval_run (
 | Qdrant | data-agent-column | 字段向量 |
 | Qdrant | data-agent-metric | 指标向量 |
 | Elasticsearch | data-agent-value | 取值全文索引 |
+
+**点/文档 id 与 MySQL 主键一致**：MySQL 侧 `table_info.id` / `column_info.id` /
+`metric_info.id` 由 `uuid5(命名空间, 自然键)` 确定性生成，Qdrant 点 id 与 ES 文档 id
+直接复用同一个 id。因此三个存储天然一一对应，召回结果无需再做 id 映射，
+重复构建也不会产生副本或孤儿数据。
+
+**向量化文本**（决定召回质量，改动前先想清楚检索侧会怎么问）：
+
+- 字段：`别名（字段名）。所属表：<表别名>。<描述>[。外键，关联 x.y]`
+- 指标：`别名（指标名）。<描述>。计算方式：<calculation>。过滤条件：<filter_condition>`
+
+别名放在最前，因为用户问的是"订单金额"而不是 `order_amount`。
+
+**ES 索引 mapping**：索引期用 `ik_max_word`（多切词，提高命中率），检索期用
+`ik_smart`（粗粒度，避免把用户输入切碎导致误召回）；`value` 字段带 `raw`
+子字段做精确匹配，防止"广东省"被切碎后模糊命中。ik 是第三方插件，未安装时
+建索引直接报错而不退回内置分词器——中文用 standard 分词基本等于单字匹配，
+静默降级会让召回质量悄悄变差。
+
+**已知限制：单路向量召回分不开近义词**。阶段 4 实测，bge-m3 单路稠密向量对
+"销售额"稳定排序为 `sales_quantity`(销量) 优于 `GMV`(成交总额)，分差极小
+（0.64 vs 0.62）。已验证这与索引文本结构无关：去掉"计算方式/过滤条件"后
+13 条问法里 12 条排序不变，说明不是 SQL 尾巴稀释语义；把口语同义词写进
+`description` 也只缩小分差、不改变结论（已保留该改写，它使"一共卖了多少钱"
+等问法由错变对，且无回退）。
+
+因此**阶段 4 保证的是召回@k，不是 top-1 精度**：正确项一定进入候选集
+（上例中 GMV 稳定排第 2），精排是阶段 6 的职责。这类近义混淆需要
+阶段 5 的 LLM 关键词抽取把"销售额"显式归到 GMV 指标，以及阶段 6 的
+RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决。
 
 ---
 
@@ -615,11 +711,21 @@ CREATE TABLE eval_run (
 | embedding.host / model | bge-m3 | YAML |
 | rerank.host / model | — | YAML |
 | jwt.secret_key / 过期 | HS256 / 30min / 7d | env（secret） |
-| qdrant.host / port / embedding_size | 6333 / 1024 | YAML |
-| es.host / port / index_name | 9200 / data-agent-value | YAML |
+| qdrant.mode / host / port / embedding_size | server / 6333 / 1024 | YAML / env（mode） |
+| qdrant.local_path | — | env（mode=local 时必填） |
+| es.scheme / host / port / index_name | http / 9200 / data-agent-value | YAML |
 | redis.host / port / password | 6379 | env |
 | sql_security.max_execution_time_ms / max_result_rows | 30000 / 10000 | 配置 |
 | cors_origins | 白名单 | env |
+
+> **embedding.host 指向服务的 OpenAI 兼容根路径**（以 `/v1` 结尾），即调用
+> `POST {host}/embeddings`。这样 Ollama / Xinference / TEI / 云厂商服务都能只改
+> 这一个地址直接替换，不必改代码。
+>
+> **qdrant.mode**：`server`（默认，连远程实例，容器编排下的标准形态）或
+> `local`（用 qdrant-client 自带的嵌入式引擎，数据落 `local_path`，不开独立进程）。
+> 两种模式 API 完全一致，业务代码不感知差异。`local` 仅用于**没有 Qdrant 服务的
+> 本地开发**，其限制是 payload 索引不生效（只影响按字段过滤的性能，过滤语义不变）。
 
 ---
 

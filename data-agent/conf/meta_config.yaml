@@ -1,31 +1,219 @@
-# 数据通达 — 元数据知识库定义（阶段 4 使用）
+# 数据通达 — 元数据知识库定义（阶段 4）
 #
-# 本文件声明"数仓里有哪些表、字段、指标"，供离线构建脚本（app/scripts）写入
-# MySQL table_info/column_info/metric_info/column_metric，并构建 Qdrant 向量索引
+# 本文件声明"数仓里有哪些表、字段、指标"，供离线构建脚本（app/scripts/build_meta.py）
+# 写入 MySQL table_info/column_info/metric_info/column_metric，并构建 Qdrant 向量索引
 # 与 ES 全文索引。知识库通过配置扩展，不改代码（NFR-MAINT-001）。
 #
-# 阶段 1 仅占位，结构在阶段 4 按 TDD 第 8.2 节的数仓表定义补全。
+# 字段含义：
+#   databases[].tables[]          TDD 8.2 数仓表
+#     .is_dimension               true=维度表，false=事实表
+#     .columns[]                  字段清单
+#       .is_primary_key           主键标记
+#       .is_foreign_key           外键标记，配合 ref_table/ref_column 用于召回后补齐关联（BR-META-001）
+#       .sync_values              true 则该字段取值同步进 ES（data-agent-value），供取值精确召回
+#   metrics[]                     指标定义，calculation/filter_condition/time_range 构成业务口径，
+#                                 生成 SQL 时必须严格遵循（BR-META-002）
+#     .relevant_columns           相关字段名，构建时解析为 column_id 写入 metric_info.relevant_columns
+#                                 与 column_metric 关联表
+#
+# 表结构必须与 app/scripts/seed_dw.py 建出的 DDL 一致（TDD 8.2）。
 
-databases: []
+databases:
+  - db_name: data_agent_dw
+    tables:
 
-# 示例（阶段 4 补全）：
-# databases:
-#   - db_name: data_agent_dw
-#     tables:
-#       - table_name: fact_order
-#         table_alias: 订单事实表
-#         description: 记录每笔订单的商品、客户、地区、时间与金额
-#         is_dimension: false
-#         columns:
-#           - column_name: order_amount
-#             column_type: decimal(18,2)
-#             column_alias: 订单金额
-#             description: 订单成交金额（不含运费）
-# metrics:
-#   - metric_name: GMV
-#     metric_alias: 成交总额
-#     description: 一定周期内订单成交金额合计
-#     calculation: SUM(fact_order.order_amount)
-#     filter_condition: 排除已取消订单
-#     time_range: 按订单日期
-#     relevant_columns: [order_amount, date_id]
+      - table_name: dim_region
+        table_alias: 地区维度表
+        description: 记录国家-大区-省份的三级地理层级，用于按地区维度做销售分析
+        is_dimension: true
+        columns:
+          - column_name: region_id
+            column_type: int
+            column_alias: 地区ID
+            description: 地区主键，自增编号
+            is_primary_key: true
+          - column_name: province
+            column_type: varchar(32)
+            column_alias: 省份
+            description: 省份名称，如"浙江省""广东省"
+            sync_values: true
+          - column_name: region_name
+            column_type: varchar(32)
+            column_alias: 大区
+            description: 大区名称，取值华东/华南/华北/华中/西南/西北/东北
+            sync_values: true
+          - column_name: country
+            column_type: varchar(32)
+            column_alias: 国家
+            description: 所属国家，当前均为中国
+
+      - table_name: dim_customer
+        table_alias: 客户维度表
+        description: 客户基本信息，含性别与会员等级，用于客户画像与分层分析
+        is_dimension: true
+        columns:
+          - column_name: customer_id
+            column_type: int
+            column_alias: 客户ID
+            description: 客户主键
+            is_primary_key: true
+          - column_name: customer_name
+            column_type: varchar(64)
+            column_alias: 客户姓名
+            description: 客户姓名（脱敏样例数据）
+          - column_name: gender
+            column_type: varchar(8)
+            column_alias: 性别
+            description: 客户性别，取值男/女
+            sync_values: true
+          - column_name: member_level
+            column_type: varchar(16)
+            column_alias: 会员等级
+            description: 会员等级，取值普通/银卡/金卡/钻石
+            sync_values: true
+
+      - table_name: dim_product
+        table_alias: 商品维度表
+        description: 商品主数据，含类目与品牌，用于商品维度的销售分析
+        is_dimension: true
+        columns:
+          - column_name: product_id
+            column_type: int
+            column_alias: 商品ID
+            description: 商品主键
+            is_primary_key: true
+          - column_name: product_name
+            column_type: varchar(128)
+            column_alias: 商品名称
+            description: 商品名称
+          - column_name: category
+            column_type: varchar(64)
+            column_alias: 商品类目
+            description: 一级类目，如"手机数码""家用电器"
+            sync_values: true
+          - column_name: brand
+            column_type: varchar(64)
+            column_alias: 品牌
+            description: 商品品牌名称
+            sync_values: true
+
+      - table_name: dim_date
+        table_alias: 日期维度表
+        description: 日期维度，提供年/季/月/日的标准层级，所有时间维度的分析都走本表
+        is_dimension: true
+        columns:
+          - column_name: date_id
+            column_type: int
+            column_alias: 日期ID
+            description: 日期主键，格式 yyyymmdd，如 20250315
+            is_primary_key: true
+          - column_name: year
+            column_type: int
+            column_alias: 年份
+            description: 自然年，如 2025
+            sync_values: true
+          - column_name: quarter
+            column_type: int
+            column_alias: 季度
+            description: 自然季度，取值 1-4
+          - column_name: month
+            column_type: int
+            column_alias: 月份
+            description: 自然月，取值 1-12
+          - column_name: day
+            column_type: int
+            column_alias: 日
+            description: 月内第几天，取值 1-31
+
+      - table_name: fact_order
+        table_alias: 订单事实表
+        description: 记录每笔订单的客户、商品、地区、时间与金额，是销售分析的事实来源
+        is_dimension: false
+        columns:
+          - column_name: order_id
+            column_type: bigint
+            column_alias: 订单ID
+            description: 订单主键
+            is_primary_key: true
+          - column_name: customer_id
+            column_type: int
+            column_alias: 客户ID
+            description: 下单客户，关联 dim_customer.customer_id
+            is_foreign_key: true
+            ref_table: dim_customer
+            ref_column: customer_id
+          - column_name: product_id
+            column_type: int
+            column_alias: 商品ID
+            description: 下单商品，关联 dim_product.product_id
+            is_foreign_key: true
+            ref_table: dim_product
+            ref_column: product_id
+          - column_name: date_id
+            column_type: int
+            column_alias: 下单日期
+            description: 下单日期，关联 dim_date.date_id
+            is_foreign_key: true
+            ref_table: dim_date
+            ref_column: date_id
+          - column_name: region_id
+            column_type: int
+            column_alias: 地区ID
+            description: 订单归属地区，关联 dim_region.region_id
+            is_foreign_key: true
+            ref_table: dim_region
+            ref_column: region_id
+          - column_name: order_quantity
+            column_type: int
+            column_alias: 订单数量
+            description: 该笔订单购买的商品件数
+          - column_name: order_amount
+            column_type: decimal(18,2)
+            column_alias: 订单金额
+            description: 订单成交金额，单位元，不含运费
+          - column_name: order_status
+            column_type: varchar(16)
+            column_alias: 订单状态
+            description: 订单状态，取值已支付/已取消/已退款
+            sync_values: true
+
+metrics:
+  - metric_name: GMV
+    metric_alias: 成交总额
+    description: 一定周期内已支付订单的成交金额合计（口语常称销售额、营收、卖了多少钱），是衡量销售规模的核心指标
+    calculation: SUM(fact_order.order_amount)
+    filter_condition: 仅统计 order_status = '已支付' 的订单，排除已取消与已退款
+    time_range: 按 dim_date.year / quarter / month 聚合
+    relevant_columns: [order_amount, order_status, date_id]
+
+  - metric_name: order_count
+    metric_alias: 订单量
+    description: 一定周期内的订单笔数，同一订单号只计一次
+    calculation: COUNT(DISTINCT fact_order.order_id)
+    filter_condition: 仅统计 order_status = '已支付' 的订单
+    time_range: 按 dim_date.year / quarter / month 聚合
+    relevant_columns: [order_id, order_status, date_id]
+
+  - metric_name: sales_quantity
+    metric_alias: 销量
+    description: 一定周期内售出的商品件数合计（口语常称销量、卖了多少件、出货件数），用于衡量出货规模
+    calculation: SUM(fact_order.order_quantity)
+    filter_condition: 仅统计 order_status = '已支付' 的订单
+    time_range: 按 dim_date.year / quarter / month 聚合
+    relevant_columns: [order_quantity, order_status, date_id]
+
+  - metric_name: avg_order_amount
+    metric_alias: 客单价
+    description: 平均每笔订单的成交金额，反映客户的单次消费能力
+    calculation: SUM(fact_order.order_amount) / COUNT(DISTINCT fact_order.order_id)
+    filter_condition: 仅统计 order_status = '已支付' 的订单，分母为订单笔数而非商品行数
+    time_range: 按 dim_date.year / quarter / month 聚合
+    relevant_columns: [order_amount, order_id, order_status, date_id]
+
+  - metric_name: active_customer_count
+    metric_alias: 活跃客户数
+    description: 一定周期内产生过已支付订单的去重客户数，用于衡量用户活跃度
+    calculation: COUNT(DISTINCT fact_order.customer_id)
+    filter_condition: 仅统计 order_status = '已支付' 的订单，同一客户多笔订单只计一次
+    time_range: 按 dim_date.year / quarter / month 聚合
+    relevant_columns: [customer_id, order_status, date_id]

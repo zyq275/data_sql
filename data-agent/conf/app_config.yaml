@@ -38,8 +38,10 @@ llm:
   max_retries: 2
 
 # Embedding / Rerank 为独立 HTTP 服务，不在应用内做本地 CPU 推理（ADR-005）
+# host 指向服务的 OpenAI 兼容根路径（即以 /v1 结尾），
+# 这样 Ollama / Xinference / TEI / 各家云服务都能直接换，只改这一个地址。
 embedding:
-  host: http://127.0.0.1:8001
+  host: http://127.0.0.1:8001/v1
   model: bge-m3
   timeout: 30
 
@@ -53,14 +55,20 @@ jwt:
   access_token_expire_minutes: 30
   refresh_token_expire_days: 7
 
+# Qdrant：mode=server 连远程实例（生产/容器编排，TDD 14.1）；
+# mode=local 用 qdrant-client 自带的嵌入式引擎（数据落 local_path，不开独立进程），
+# 仅用于没有 Qdrant 服务的本地开发。两种模式 API 一致，靠 .env 覆盖切换。
 qdrant:
+  mode: server
   host: 127.0.0.1
   port: 6333
+  local_path: ""
   embedding_size: 1024
   column_collection: data-agent-column
   metric_collection: data-agent-metric
 
 es:
+  scheme: http
   host: 127.0.0.1
   port: 9200
   index_name: data-agent-value

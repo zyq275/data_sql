@@ -16,22 +16,27 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "asyncmy>=0.2.9",
     "alembic>=1.14",
+    # MySQL 8 默认认证插件 caching_sha2_password 在服务端缓存失效时（重启、FLUSH PRIVILEGES）
+    # 要求客户端做 RSA 公钥加密，asyncmy 依赖 cryptography 提供该能力；缺失则直接连不上
+    "cryptography>=42.0",
     # 认证（阶段 3）
     "pyjwt>=2.9",
     "bcrypt>=4.1",
+    # 知识库构建（阶段 4）
+    # httpx 同时承担 Embedding 服务的 HTTP 调用，以及接口验收的 ASGI transport
+    "httpx>=0.27",
+    "qdrant-client>=1.12",
+    "elasticsearch[async]>=8.15,<9",
 ]
 
-# 以下依赖按开发阶段逐步启用（见《开发步骤文档》），避免阶段 1 引入未使用的重依赖：
-#   阶段 4  知识库构建  : qdrant-client, elasticsearch[async], httpx
+# 以下依赖按开发阶段逐步启用（见《开发步骤文档》），避免过早引入未使用的重依赖：
 #   阶段 5  Agent 闭环  : langgraph>=1.0, langchain>=1.2, langchain-openai
 #   阶段 6  混合检索    : redis[hiredis]
 #   阶段 11 可观测      : loguru, opentelemetry-sdk, opentelemetry-instrumentation-fastapi, langfuse
 
 [project.optional-dependencies]
 # 开发/验收用：uv pip install -e ".[dev]"
-# httpx 在阶段 3 已用于接口验收（ASGI transport，无需起服务）
 dev = [
-    "httpx>=0.27",
     "pytest>=8",
     "pytest-asyncio>=0.24",
 ]
