@@ -1,0 +1,88 @@
+# 数据通达 — 基础配置（非敏感项默认值）
+#
+# 优先级：环境变量 > .env > 本文件 > 代码默认值（见 app/core/config.py）
+# 敏感项（数据库口令、LLM api_key、JWT secret）不写入本文件，仅经环境变量/.env 注入（NFR-SEC-003）
+# 环境变量名用双下划线表示层级，如 DB_META__PASSWORD、LLM__API_KEY、JWT__SECRET_KEY
+
+app:
+  name: 数据通达
+  version: 3.0.0
+  debug: false
+  api_prefix: /api/v1
+
+# 元数据库（可写，承载 11 张元数据表）
+db_meta:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  database: data_agent_meta
+  charset: utf8mb4
+  pool_size: 10
+  max_overflow: 20
+
+# 数仓库（只读账号，最小权限，ADR-004 / NFR-SEC-007）
+db_dw:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  database: data_agent_dw
+  charset: utf8mb4
+  pool_size: 10
+  max_overflow: 20
+
+llm:
+  model_name: deepseek-chat
+  base_url: https://api.deepseek.com/v1
+  temperature: 0.0
+  timeout: 60
+  max_retries: 2
+
+# Embedding / Rerank 为独立 HTTP 服务，不在应用内做本地 CPU 推理（ADR-005）
+embedding:
+  host: http://127.0.0.1:8001
+  model: bge-m3
+  timeout: 30
+
+rerank:
+  host: http://127.0.0.1:8002
+  model: bge-reranker-v2-m3
+  timeout: 30
+
+jwt:
+  algorithm: HS256
+  access_token_expire_minutes: 30
+  refresh_token_expire_days: 7
+
+qdrant:
+  host: 127.0.0.1
+  port: 6333
+  embedding_size: 1024
+  column_collection: data-agent-column
+  metric_collection: data-agent-metric
+
+es:
+  host: 127.0.0.1
+  port: 9200
+  index_name: data-agent-value
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+
+# SQL 安全治理参数（BR-SQL-001/003/004）
+sql_security:
+  max_execution_time_ms: 30000
+  max_result_rows: 10000
+  allowed_statement_prefixes:
+    - SELECT
+    - WITH
+    - EXPLAIN
+    - DESC
+    - SHOW
+    - DESCRIBE
+
+# CORS 白名单，生产环境禁止通配符（NFR-SEC-006）
+cors_origins:
+  - http://localhost:5173
+  - http://127.0.0.1:5173

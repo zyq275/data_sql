@@ -1,0 +1,711 @@
+# 数据通达 — 技术设计文档（TDD）
+
+| 项目名称 | 数据通达（Data-Agent） |
+|---|---|
+| 文档类型 | 技术设计文档（TDD） |
+| 文档版本 | V3.0 |
+| 编写日期 | 2026-08-18 |
+| 对应需求 | 《数据通达-需求规格说明书（PRD）》V3.0 |
+
+---
+
+## 修订历史
+
+| 版本 | 日期 | 修订说明 |
+|---|---|---|
+| V1.0 | — | 单轮 NL2SQL 架构 |
+| V2.0 | — | 认证、流式、统一异常 |
+| V3.0 | 2026-08-18 | 架构重构：多轮对话、混合检索、可解释性、评测体系、数据权限治理 |
+
+---
+
+## 1. 架构总览
+
+### 1.1 分层架构
+
+依赖方向自上而下，上层依赖下层，下层不感知上层。
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    接入层（前端 Vue 3 + TypeScript）            │
+│    Vue 3 + Pinia + Vue Router + Element Plus + ECharts         │
+└──────────────────────────┬───────────────────────────────────┘
+                           │ HTTP / SSE（JSON）
+┌──────────────────────────▼───────────────────────────────────┐
+│                     接口层（FastAPI）                           │
+│   认证 / 会话 / 问答 / 历史 / 管理 / 权限 / 评测 / 健康探针        │
+│   统一响应 + 统一异常 + CORS + request_id 追踪                   │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+┌──────────────────────────▼───────────────────────────────────┐
+│                 智能体层（LangGraph，带 checkpointer）           │
+│   抽取 → 混合检索 → 合并过滤 → 生成 → 校验 → 校正 → 执行 → 解释 → 可视化推荐 │
+│   SQL 白名单安全治理 + 数据权限注入                              │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+┌──────────────────────────▼───────────────────────────────────┐
+│                      存储层                                    │
+│   MySQL（meta+dw）│ Qdrant（向量）│ ES（全文）│ Redis（会话/缓存） │
+└──────────────────────────────────────────────────────────────┘
+
+            离线：知识构建层 + 评测层 + 可观测层（OTel/Langfuse）
+```
+
+### 1.2 依赖方向原则
+
+- 接口层依赖智能体层与存储层，智能体层依赖存储层。
+- 业务通过 Repository 访问存储，通过 ClientManager 管理连接生命周期。
+- State 与 Context 用 TypedDict 定义，贯穿 Agent 全流程。
+
+---
+
+## 2. 技术选型
+
+| 类别 | 技术 | 版本 | 选型理由 |
+|---|---|---|---|
+| 语言 | Python | ≥3.12 | 新式泛型语法 |
+| Web 框架 | FastAPI | ≥0.128 | 原生异步、自动 OpenAPI、SSE 友好 |
+| Agent 编排 | LangGraph | ≥1.0 | 图式编排、checkpointer、stream 模式 |
+| LLM 接入 | LangChain | ≥1.2 | 统一 Prompt/OutputParser 抽象 |
+| 模型 | DeepSeek/Qwen/GLM（可插拔） | OpenAI 兼容 | 中文友好、成本可控 |
+| 嵌入模型 | bge-m3（独立服务） | — | 多语言、语义强 |
+| ORM | SQLAlchemy 2.0（async）+ Alembic | ≥2.0 | 异步 + 数据库迁移 |
+| MySQL 驱动 | asyncmy | ≥0.2 | 异步驱动 |
+| 向量库 | Qdrant | ≥1.16 | 独立部署、相似度检索 |
+| 全文检索 | Elasticsearch | 8.x | ik 中文分词 |
+| 缓存/会话 | Redis | ≥5.0 | checkpointer + 缓存 |
+| 配置 | pydantic-settings | ≥2.0 | 类型安全、环境变量注入 |
+| 认证 | PyJWT + passlib(bcrypt) | — | 标准 JWT + 哈希 |
+| 日志 | loguru | ≥0.7 | 结构化、可 patch request_id |
+| 可观测 | OpenTelemetry + Langfuse | — | 链路追踪 + LLM 追踪 |
+| 测试 | pytest | — | 单测 + 评测 |
+| 前端 | Vue 3 + TypeScript + Pinia + Vue Router + Element Plus + ECharts | — | 组合式 API、企业级组件 |
+
+---
+
+## 3. 目录结构
+
+```
+data-agent/                        # 后端
+├── main.py                        # 入口
+├── pyproject.toml                 # 依赖
+├── alembic/                       # 数据库迁移
+├── conf/
+│   ├── app_config.yaml            # 基础配置
+│   └── meta_config.yaml           # 元数据知识库定义
+├── prompts/                       # 提示词文件
+├── app/
+│   ├── api/                       # 接口层
+│   │   ├── middleware.py
+│   │   ├── dependencies.py
+│   │   └── v1/{auth,conversation,query,history,admin,permission,eval}.py
+│   ├── agent/                     # 智能体层
+│   │   ├── graph.py               # 图编排（带 checkpointer）
+│   │   ├── state.py / context.py
+│   │   ├── llm.py                 # LLM 实例
+│   │   └── nodes/*.py             # 各节点
+│   ├── retrievers/                # 检索层（混合检索/rerank）
+│   ├── clients/                   # 连接管理器
+│   ├── repositories/              # 数据访问层
+│   ├── entities/                  # 领域实体
+│   ├── models/                    # ORM 模型
+│   ├── schemas/                   # 请求/响应
+│   ├── services/                  # 服务层
+│   ├── core/                      # 配置/安全/异常/日志/响应
+│   └── scripts/                   # 离线脚本
+├── evals/                         # 评测集与评测脚本
+└── tests/                         # 单元测试
+data-agent-frontend/               # 前端
+├── src/
+│   ├── api/ stores/ router/ layouts/ views/
+│   └── styles/                    # 设计 Token
+```
+
+---
+
+## 4. 模块设计
+
+| 模块 | 职责 |
+|---|---|
+| core.config | pydantic-settings 分层配置 |
+| core.security | JWT、bcrypt、角色依赖 |
+| core.response / exceptions | 统一响应与错误码 |
+| agent.graph | 节点与边定义，编译带 checkpointer 的图 |
+| agent.nodes.* | 单一职责节点 |
+| retrievers.* | 混合检索、RRF 融合、rerank |
+| clients.* | 外部连接生命周期 |
+| repositories.* | 存储访问封装 |
+| services.* | 业务编排 |
+
+### 分层约束
+
+- 节点签名统一 `async def node(state, runtime)`，依赖经 `runtime.context`，流式经 `runtime.stream_writer`。
+- 节点间通过 State 传数据，禁止直接 import 其它节点。
+- Repository 只存取，不含 LLM 逻辑；LLM 逻辑集中在节点与提示词。
+
+---
+
+## 5. 核心流程
+
+### 5.1 Agent 编排图
+
+```
+START
+  │
+  ▼
+resolve_reference        （指代消解："那/换成/再/对比" → 补全为完整问题）
+  │
+  ▼
+extract_keywords ────────┬──────────────────────────────┐
+  │                      │                              │
+  ▼                      ▼                              ▼
+recall_column        recall_value                  recall_metric
+  │                      │                              │
+  └──────────────────────┴──────────────────────────────┘
+                         ▼
+              merge_retrieved_info
+                         │
+              ┌──────────┴──────────┐
+              ▼                     ▼
+         filter_table          filter_metric
+              │                     │
+              └──────────┬──────────┘
+                         ▼
+                add_extra_context      （注入日期/数据库/会话历史/数据权限）
+                         │
+                         ▼
+                  generate_sql
+                         │
+                         ▼
+                  validate_sql
+                         │
+              ┌──────────┴─────────────────────┐
+              │ error == None                  │ error != None
+              ▼                                ▼
+       execute_sql                    correction_count < 3 ?
+              │                          ├─ 是 ─► correct_sql ─► validate_sql（count + 1）
+              │                          └─ 否 ─► END（终止并返回明确错误）
+              ▼
+       generate_explain                     （生成自然语言解释）
+              │
+              ▼
+       recommend_visualization              （按结果结构推荐图表类型）
+              │
+              ▼
+             END
+```
+
+关键编排逻辑：
+
+- resolve_reference 为图入口节点，先做指代消解再抽取关键字；首轮无会话历史时原样透传（对应 FR-CONV-004）。
+- 三路召回并行，汇聚到 merge。
+- filter_table 与 filter_metric 并行，汇聚到 add_extra_context。
+- validate_sql 条件边分流：校验通过进 execute_sql；校验失败且 correction_count < 3 进 correct_sql、计数加 1 后回边重校；correction_count ≥ 3 时终止图并返回明确错误（对应 BR-SQL-005、FR-QA-008）。
+- 新增 generate_explain 节点，在执行成功后生成解释；随后 recommend_visualization 按结果结构推荐图表类型。
+
+**State 关键字段（TypedDict）**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| query | str | 用户本轮原始问题 |
+| resolved_query | str | 指代消解后的完整问题；resolve_reference 之后的节点统一消费该字段 |
+| session_id | str \| None | 会话标识，首轮为空 |
+| history | list | 会话历史（上文问题/SQL/过滤条件/授权范围），由 checkpointer 注入 |
+| correction_count | int | SQL 校正次数，初值 0，上限 3（BR-SQL-005） |
+| error | str \| None | validate_sql 写回，驱动条件边分流 |
+
+### 5.2 混合检索流程
+
+```
+关键字（jieba + LLM 扩展）
+        │
+        ├──→ Embedding 服务 → Qdrant 向量检索 ──┐
+        │                                      ├──→ RRF 融合 → Rerank 精排 → 最终召回
+        └──→ ES 全文检索（ik 分词）─────────────┘
+```
+
+### 5.3 多轮会话流程
+
+```
+用户问题（带 session_id）
+        │
+        ▼
+  加载会话历史（Redis checkpointer）
+        │
+        ▼
+  指代消解 resolve_reference：解析"那/换成/再/对比" → resolved_query
+        │
+        ▼
+  执行 Agent 图（add_extra_context 注入上文问题/SQL/过滤条件与数据权限）
+        │
+        ▼
+  生成新结果 → 写回会话状态（message）→ 落 query_history
+```
+
+### 5.4 端到端时序
+
+```
+用户 → 前端(SSE) → FastAPI /query
+                     │  校验 JWT
+                     │  加载会话（Redis）
+                     │  构建 Context + State
+                     ▼
+              graph.astream(...)  ── 逐节点流式
+                     │  resolve → extract → 混合检索 → merge → filter → context
+                     │  generate → validate → (correct) → execute → explain → visualize
+                     ▼
+              结果/SQL/解释事件 → 前端渲染
+                     │
+                     ▼
+              异步落 query_history + 会话状态（失败不影响主流程）
+```
+
+---
+
+## 6. 提示词设计
+
+提示词独立存放 `prompts/*.prompt`，支持版本管理。
+
+| 提示词 | 用途 | 输出 |
+|---|---|---|
+| resolve_reference | 指代消解/问题改写（结合会话历史补全指代） | 纯文本（改写后的完整问题） |
+| extend_keywords_for_column_recall | 字段召回扩展 | JSON 数组 |
+| extend_keywords_for_metric_recall | 指标召回扩展 | JSON 数组 |
+| extend_keywords_for_value_recall | 取值召回扩展 | JSON 数组 |
+| filter_table_info | 裁剪表字段 | JSON 对象 |
+| filter_metric_info | 筛选指标 | JSON 数组 |
+| generate_sql | 生成 SQL | 纯文本 SQL |
+| correct_sql | 修正 SQL | 纯文本 SQL |
+| generate_explain | 生成解释 | 纯文本 |
+| recommend_visualization | 图表类型推荐 | JSON 对象 |
+
+### 核心提示词示例（generate_sql）
+
+```
+【角色】
+你是一个资深的数据库专家和数据分析师。你的任务是根据提供的【上下文信息】，
+将用户的自然语言查询转换为语法正确、性能优化的 SQL 语句。
+
+【上下文信息】
+可用数据表信息如下：{table_infos}
+可参考的指标信息如下：{metric_infos}
+当前的时间信息如下：{date_info}
+数据库环境如下：{db_info}
+
+【任务要求】
+1. 仅允许使用数据表信息中真实存在的表与字段名称，禁止编造、猜测或引入未提供的表和字段。
+2. 若指标信息中存在相关指标定义，必须严格遵循其业务口径、计算逻辑、过滤规则与时间口径。
+3. 生成的SQL只能用于查询，不能涉及数据写入、更新、删除等操作。
+4. 生成的SQL的语法必须严格符合数据库环境中指定的数据库类型与版本。
+5. 默认只生成一条SQL，不可生成多条SQL。
+6. 输出必须仅包含一条完整 SQL 语句的纯文本，严禁使用 Markdown 代码块或任何格式化符号。
+
+用户查询如下：{query}
+输出：
+```
+
+### 提示词设计原则
+
+- 输出约束严格：SQL 纯文本、过滤纯 JSON，便于程序化解析。
+- 防注入：明确"仅使用提供的表/字段"，降低幻觉与越权。
+- 指标口径锁定：要求"严格遵循指标定义，不得偏离"。
+
+---
+
+## 7. 接口设计
+
+### 7.1 统一响应结构
+
+```json
+{ "code": 0, "message": "ok", "data": {} }
+```
+
+分页结构：`{ "items": [], "total": 0, "page": 1, "page_size": 20 }`。
+
+### 7.2 REST 端点清单
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | /api/v1/auth/login | 无 | 登录 |
+| POST | /api/v1/auth/refresh | 无 | 刷新令牌 |
+| GET | /api/v1/auth/me | Bearer | 当前用户 |
+| PUT | /api/v1/auth/password | Bearer | 改密码 |
+| POST | /api/v1/conversations | Bearer | 创建会话 |
+| GET | /api/v1/conversations | Bearer | 会话列表 |
+| GET | /api/v1/conversations/{id} | Bearer | 会话详情（含消息列表，仅本人） |
+| DELETE | /api/v1/conversations/{id} | Bearer | 删除会话 |
+| POST | /api/v1/query | Bearer | 问答（SSE，含 session_id） |
+| GET | /api/v1/history | Bearer | 历史列表 |
+| GET | /api/v1/history/{id} | Bearer | 历史详情 |
+| DELETE | /api/v1/history/{id} | Bearer | 删除历史 |
+| GET | /api/v1/admin/users | admin | 用户列表 |
+| POST | /api/v1/admin/users | admin | 创建用户 |
+| PUT | /api/v1/admin/users/{id}/role | admin | 改角色 |
+| PUT | /api/v1/admin/users/{id}/status | admin | 启停 |
+| GET/POST/PUT/DELETE | /api/v1/permissions/* | admin | 数据权限 |
+| GET | /api/v1/eval/cases | admin | 评测集列表 |
+| POST | /api/v1/eval/cases | admin | 批量导入评测样本 |
+| DELETE | /api/v1/eval/cases/{id} | admin | 删除评测样本 |
+| POST | /api/v1/eval/run | admin | 运行评测 |
+| GET | /api/v1/eval/runs | admin | 评测运行记录（看板趋势数据） |
+| GET | /api/v1/eval/runs/{id} | admin | 评测运行详情 |
+| GET | /api/v1/dashboard/metrics | analyst | 数据看板指标趋势 |
+| GET | /api/v1/dashboard/dimensions | analyst | 数据看板可用维度 |
+| GET | /health | 无 | 存活 |
+| GET | /health/ready | 无 | 就绪 |
+
+### 7.3 SSE 事件协议
+
+| type | 含义 | 字段 |
+|---|---|---|
+| progress | 节点进度 | step、status |
+| result | 查询结果 | data（行数组） |
+| sql | 生成的 SQL | sql |
+| explain | 自然语言解释 | text |
+| viz | 图表类型推荐 | chart_type |
+| error | 出错 | message |
+
+---
+
+## 8. 数据模型
+
+### 8.1 元数据库（meta）
+
+**user**
+
+```sql
+CREATE TABLE user (
+  id VARCHAR(64) PRIMARY KEY,
+  username VARCHAR(128) NOT NULL,
+  password_hash VARCHAR(256) NOT NULL,
+  role VARCHAR(32) NOT NULL,           -- viewer / analyst / admin
+  display_name VARCHAR(128),
+  is_active TINYINT(1) DEFAULT 1,
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL,
+  UNIQUE KEY uk_username (username)
+);
+```
+
+**query_history**
+
+```sql
+CREATE TABLE query_history (
+  id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64) NOT NULL,
+  session_id VARCHAR(64),
+  query_text TEXT,
+  generated_sql TEXT,
+  result_preview JSON,
+  explain_text TEXT,
+  status VARCHAR(32),                  -- success / failed
+  duration_ms INT,
+  created_at DATETIME NOT NULL,
+  INDEX idx_user_id (user_id)
+);
+```
+
+**conversation**
+
+```sql
+CREATE TABLE conversation (
+  id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64) NOT NULL,
+  title VARCHAR(256),
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL,
+  INDEX idx_user_id (user_id)
+);
+```
+
+**message**
+
+```sql
+CREATE TABLE message (
+  id VARCHAR(64) PRIMARY KEY,
+  conversation_id VARCHAR(64) NOT NULL,
+  user_id VARCHAR(64) NOT NULL,
+  role VARCHAR(16) NOT NULL,          -- user / assistant
+  query_text TEXT,
+  generated_sql TEXT,
+  result_preview JSON,
+  explain_text TEXT,
+  created_at DATETIME NOT NULL,
+  INDEX idx_conversation_id (conversation_id),
+  INDEX idx_user_id (user_id)
+);
+```
+
+**table_info**
+
+```sql
+CREATE TABLE table_info (
+  id VARCHAR(64) PRIMARY KEY,
+  db_name VARCHAR(64) NOT NULL,
+  table_name VARCHAR(128) NOT NULL,
+  table_alias VARCHAR(128),
+  description TEXT,
+  is_dimension TINYINT(1) DEFAULT 0,
+  created_at DATETIME NOT NULL,
+  UNIQUE KEY uk_db_table (db_name, table_name)
+);
+```
+
+**column_info**
+
+```sql
+CREATE TABLE column_info (
+  id VARCHAR(64) PRIMARY KEY,
+  table_id VARCHAR(64) NOT NULL,
+  column_name VARCHAR(128) NOT NULL,
+  column_type VARCHAR(64),
+  column_alias VARCHAR(128),
+  description TEXT,
+  is_primary_key TINYINT(1) DEFAULT 0,
+  is_foreign_key TINYINT(1) DEFAULT 0,
+  ref_table_id VARCHAR(64),
+  ref_column_id VARCHAR(64),
+  created_at DATETIME NOT NULL,
+  INDEX idx_table_id (table_id)
+);
+```
+
+**metric_info**
+
+```sql
+CREATE TABLE metric_info (
+  id VARCHAR(64) PRIMARY KEY,
+  metric_name VARCHAR(128) NOT NULL,
+  metric_alias VARCHAR(128),
+  description TEXT,
+  calculation TEXT,                    -- 计算逻辑/口径
+  filter_condition TEXT,               -- 过滤规则
+  time_range VARCHAR(128),             -- 时间口径
+  relevant_columns TEXT,               -- 相关字段（column_id 列表）
+  created_at DATETIME NOT NULL
+);
+```
+
+**column_metric**
+
+```sql
+CREATE TABLE column_metric (
+  column_id VARCHAR(64) NOT NULL,
+  metric_id VARCHAR(64) NOT NULL,
+  PRIMARY KEY (column_id, metric_id),
+  INDEX idx_metric_id (metric_id)
+);
+```
+
+**permission**
+
+```sql
+CREATE TABLE permission (
+  id VARCHAR(64) PRIMARY KEY,
+  role VARCHAR(32) NOT NULL,
+  resource_type VARCHAR(16) NOT NULL, -- table / column
+  resource_id VARCHAR(64) NOT NULL,
+  created_at DATETIME NOT NULL,
+  INDEX idx_role (role)
+);
+```
+
+**eval_case**
+
+```sql
+CREATE TABLE eval_case (
+  id VARCHAR(64) PRIMARY KEY,
+  query_text TEXT NOT NULL,
+  expected_sql TEXT,
+  expected_result JSON,
+  created_at DATETIME NOT NULL
+);
+```
+
+**eval_run**
+
+```sql
+CREATE TABLE eval_run (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(256),                   -- 本次评测名称
+  total_cases INT NOT NULL DEFAULT 0,
+  accuracy DECIMAL(6,4),               -- 准确率
+  recall_hit_rate DECIMAL(6,4),        -- 召回命中率
+  execute_success_rate DECIMAL(6,4),   -- 执行成功率
+  avg_duration_ms INT,                 -- 平均耗时
+  detail JSON,                         -- 逐条样本结果
+  status VARCHAR(32),                  -- running / finished / failed
+  created_at DATETIME NOT NULL,
+  INDEX idx_created_at (created_at)
+);
+```
+
+> 说明：评测看板的"趋势"（FR-EVAL-003）依赖 eval_run 按 created_at 的历史记录；评测过程不写入 conversation/message/query_history（BR-EVAL-001）。
+
+### 8.2 数仓库（dw）
+
+| 表 | 关键字段 |
+|---|---|
+| dim_region | region_id, province, region_name, country |
+| dim_customer | customer_id, customer_name, gender, member_level |
+| dim_product | product_id, product_name, category, brand |
+| dim_date | date_id, year, quarter, month, day |
+| fact_order | order_id, customer_id, product_id, date_id, region_id, order_quantity, order_amount |
+
+### 8.3 向量库与全文索引
+
+| 存储 | 集合/索引 | 内容 |
+|---|---|---|
+| Qdrant | data-agent-column | 字段向量 |
+| Qdrant | data-agent-metric | 指标向量 |
+| Elasticsearch | data-agent-value | 取值全文索引 |
+
+---
+
+## 9. 关键设计决策（ADR）
+
+### ADR-001 采用 LangGraph 而非手写编排
+- **理由**：图结构分叉-汇聚-条件边，LangGraph 原生支持并行分支、条件路由、流式与 checkpointer。
+
+### ADR-002 三路召回并行
+- **理由**：字段/指标走语义向量，取值走精确全文，覆盖语义与精确两类需求。
+
+### ADR-003 采用 SSE 而非 WebSocket
+- **理由**：查询是单向服务端推送，SSE 基于 HTTP，实现简单、代理友好、支持重连。
+
+### ADR-004 meta 与 dw 分库
+- **理由**：职责分离，dw 只读、meta 可写，便于权限隔离。
+
+### ADR-005 Embedding 独立服务化
+- **理由**：bge-m3 本地 CPU 推理延迟高，独立服务化支持 GPU 加速与水平扩展。
+
+### ADR-006 会话采用 LangGraph checkpointer + Redis
+- **理由**：复用状态快照能力，Redis 保证多实例共享与低延迟，重启可恢复。
+
+### ADR-007 混合检索采用 RRF + rerank
+- **理由**：RRF 无需调权、对异构分数鲁棒；rerank 交叉编码提升排序精度。
+
+### ADR-008 SQL 安全采用白名单解析 + 只读账号
+- **理由**：黑名单可被混淆绕过，白名单（sqlparse 解析 + 只读账号 + 最小权限）从机制上杜绝写操作。
+
+---
+
+## 10. 非功能落地方案
+
+| 需求 | 落地方式 |
+|---|---|
+| 请求追踪 | 中间件 uuid 注入 ContextVar，loguru patch |
+| 链路追踪 | OpenTelemetry 采集，Langfuse 追踪 LLM 调用 |
+| 安全防护 | 见"安全设计" |
+| 健康探针 | /health 存活、/health/ready 检查 MySQL/Qdrant/Redis |
+| 优雅启停 | lifespan 中 init/close ClientManager |
+| 超时与重试 | LLM 超时+重试；SQL max_execution_time + 行数上限 |
+| 日志分级 | loguru 文件+控制台，rotation/retention 配置化 |
+| 数据库迁移 | Alembic 管理 schema 演进 |
+
+---
+
+## 11. 配置清单
+
+| 配置项 | 默认值 | 来源 |
+|---|---|---|
+| app_name / debug | 数据通达 / false | YAML / env |
+| db_meta / db_dw | host/port/user/password/database | env（口令） |
+| llm.model_name / base_url / api_key | 可插拔 | env（api_key） |
+| embedding.host / model | bge-m3 | YAML |
+| rerank.host / model | — | YAML |
+| jwt.secret_key / 过期 | HS256 / 30min / 7d | env（secret） |
+| qdrant.host / port / embedding_size | 6333 / 1024 | YAML |
+| es.host / port / index_name | 9200 / data-agent-value | YAML |
+| redis.host / port / password | 6379 | env |
+| sql_security.max_execution_time_ms / max_result_rows | 30000 / 10000 | 配置 |
+| cors_origins | 白名单 | env |
+
+---
+
+## 12. 错误处理
+
+### 12.1 错误码体系
+
+| 范围 | 类别 | 示例 |
+|---|---|---|
+| 400xx | 参数校验 | 40000 ValidationError |
+| 401xx | 认证 | 40100 AuthError、TokenExpired、InvalidToken |
+| 402xx | 查询 | 40200 QueryError、SQLGeneration、SQLExecution、SQLSecurity、Timeout |
+| 403xx | 权限 | 40300 PermissionDenied |
+| 404xx | 资源 | 40400 NotFound |
+| 500xx | 服务 | 50000 ServiceError、LLMServiceError |
+
+> 说明：HTTP 状态码与业务码同步返回——`code` 字段承载业务码（如 40100/40300/40000），HTTP 状态码按类别映射（400→400xx、401→401xx、403→403xx、404→404xx、500→500xx）。PRD 验收标准中的「返回 401/403/400」均指 HTTP 状态码。
+
+### 12.2 处理策略
+
+- 业务异常抛 AppException 子类，全局 handler 统一转 JSON。
+- 未捕获异常由兜底 handler 转 500。
+- SSE 流内异常以 type=error 事件推送，不中断连接。
+- 历史落库失败隔离捕获，不影响主流程。
+
+---
+
+## 13. 安全设计
+
+| 威胁 | 防护 |
+|---|---|
+| SQL 注入 | sqlparse 白名单解析 + 只读账号 + 前缀/关键词校验 |
+| 越权访问 | JWT 鉴权 + 角色依赖 + 资源归属校验（user_id 过滤） |
+| 数据越权 | 表/字段级权限注入 SQL 生成上下文 |
+| 凭据泄露 | bcrypt 哈希、敏感配置环境变量注入、密钥不进代码库 |
+| Prompt 注入 | 提示词约束"仅使用提供的表/字段"，隔离用户输入 |
+| 令牌滥用 | 访问/刷新令牌分离、短期过期、类型校验 |
+| 慢查询 | max_execution_time + max_result_rows 双重限制 |
+
+---
+
+## 14. 部署与运行
+
+### 14.1 容器编排
+
+```
+nginx（前端静态 + 反向代理）
+backend（FastAPI）
+mysql（meta + dw）
+qdrant（向量）
+elasticsearch（全文）
+redis（缓存/会话）
+embedding-service（向量化）
+rerank-service（重排）
+```
+
+- 前端经 Nginx 托管，`/api` 反向代理至后端，关闭 SSE 缓冲。
+- 后端经 lifespan 初始化连接，依赖健康检查顺序启动。
+
+### 14.2 运行命令
+
+```
+make up          # 启动全部服务
+make init-admin  # 初始化管理员
+make seed        # 生成数仓测试数据
+make build-meta  # 构建元数据知识库
+make migrate     # 执行数据库迁移
+make test        # 运行测试
+make eval        # 运行评测
+```
+
+---
+
+## 15. 开发任务拆解
+
+| 阶段 | 任务 | 产出 |
+|---|---|---|
+| 1 | 项目骨架：目录、配置、依赖、Alembic、迁移 | 可运行空应用 |
+| 2 | 数据模型：meta 11 张表（含 table_info/column_info/metric_info/column_metric/eval_run） | 迁移脚本 |
+| 3 | 认证与用户管理 | 登录/权限闭环 |
+| 4 | 知识库构建：元数据 + 向量 + 全文索引 | 离线构建脚本 |
+| 5 | 单轮 Agent：抽取→召回→生成→校验→执行 | 单轮 NL2SQL 闭环 |
+| 6 | 混合检索：RRF + rerank 接入 | 召回优化 |
+| 7 | 多轮会话与查询历史：checkpointer + 指代消解 + 上下文注入 + history 接口 | 多轮问答 + 历史管理 |
+| 8 | 可解释性与可视化：generate_explain + recommend_visualization 节点 | SQL 解释 + 图表推荐 |
+| 9 | 数据权限：权限模型 + SQL 生成上下文注入 | 权限治理 |
+| 10 | 评测体系与数据看板：评测集 + 批量评测 + eval_run 记录 + 看板接口 | 效果度量 |
+| 11 | 可观测：OTel + Langfuse + 指标 | 链路追踪 |
+| 12 | 前端：设计系统 + 会话 UI + 可解释展示 + 个人设置 + 数据看板 + 评测看板 | 交互落地 |

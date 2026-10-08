@@ -1,0 +1,31 @@
+# 数据通达 — 元数据知识库定义（阶段 4 使用）
+#
+# 本文件声明"数仓里有哪些表、字段、指标"，供离线构建脚本（app/scripts）写入
+# MySQL table_info/column_info/metric_info/column_metric，并构建 Qdrant 向量索引
+# 与 ES 全文索引。知识库通过配置扩展，不改代码（NFR-MAINT-001）。
+#
+# 阶段 1 仅占位，结构在阶段 4 按 TDD 第 8.2 节的数仓表定义补全。
+
+databases: []
+
+# 示例（阶段 4 补全）：
+# databases:
+#   - db_name: data_agent_dw
+#     tables:
+#       - table_name: fact_order
+#         table_alias: 订单事实表
+#         description: 记录每笔订单的商品、客户、地区、时间与金额
+#         is_dimension: false
+#         columns:
+#           - column_name: order_amount
+#             column_type: decimal(18,2)
+#             column_alias: 订单金额
+#             description: 订单成交金额（不含运费）
+# metrics:
+#   - metric_name: GMV
+#     metric_alias: 成交总额
+#     description: 一定周期内订单成交金额合计
+#     calculation: SUM(fact_order.order_amount)
+#     filter_condition: 排除已取消订单
+#     time_range: 按订单日期
+#     relevant_columns: [order_amount, date_id]
