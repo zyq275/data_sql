@@ -48,7 +48,15 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app.name,
         version=settings.app.version,
-        debug=settings.app.debug,
+        # 恒为 False，不透传 settings.app.debug（TDD 7.1 要求响应结构恒定统一）。
+        # Starlette 的 ServerErrorMiddleware 在 debug=True 时会让调试页优先于我们注册的
+        # 兜底 handler，未捕获异常将返回裸 traceback 文本而非 {code, message, data}，
+        # 前端的 code 解析恰好会在开发环境被打破；且调试页会渲染帧局部变量，
+        # 对登录/改密这类请求有泄明文口令的风险。
+        # 排查所需的堆栈由 core.handlers 的 _handle_unexpected 写进日志，信息不丢；
+        # 本地热重载用 uvicorn --reload，与 debug 开关无关。
+        # settings.app.debug 仍用于别处：CORS 通配符放行、启动日志与 /health 输出。
+        debug=False,
         lifespan=lifespan,
     )
 

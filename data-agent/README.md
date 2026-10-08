@@ -123,6 +123,11 @@ data-agent/
   `UnicodeDecodeError`）。
 - **前端端口**：`data-agent-frontend` 固定使用 5173（`strictPort: true`），
   与 `cors_origins` 白名单一一对应；端口被占用时会直接报错，请先腾出端口。
+- **`APP__DEBUG=true` 不会开启 FastAPI 调试页**（`FastAPI(debug=False)` 恒定）。
+  Starlette 的调试页会绕过统一异常 handler，让 500 返回裸 traceback 而非
+  `{code, message, data}`，且会渲染帧局部变量（登录/改密请求有泄口令风险）。
+  它只影响 CORS 通配符放行、启动日志与 `/health` 的 `debug` 字段；
+  未捕获异常的完整堆栈始终在服务端日志里。
 - **密码哈希不用 passlib**：passlib 最新版仍是 1.7.4（2020 年，已停维护），其 bcrypt
   后端在自检阶段会喂超 72 字节输入给 `hashpw`，与 bcrypt 4.1+ 的严格校验冲突，
   `CryptContext(schemes=["bcrypt"])` 直接构造失败。因此 `app/core/security.py`
