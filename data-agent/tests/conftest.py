@@ -1,0 +1,82 @@
+"""测试夹具，以及「外部依赖是否就绪」的判定。
+
+阶段 4 起的验收依赖一整套外部服务（MySQL / Qdrant / Elasticsearch / Embedding）。
+这套服务并非每个环境都有，所以带 ``requires_stack`` 标记的测试在服务没起时
+**跳过并说明缺什么**，而不是失败——失败会掩盖真正的问题，跳过才是诚实的状态描述。
+
+但跳过的边界要说清楚：只判断「进程有没有在监听」。服务在监听而口令错、
+知识库没建、字段对不上，那是真问题，必须失败，不能被跳过掩盖。
+
+会话级事件循环：app.clients 下的 Qdrant / ES 客户端是按进程持有的单例，
+绑在创建它的那个事件循环上。若每个测试各起一个循环，第一个测试创建的客户端
+到第二个测试就成了「绑在已关闭循环上」的僵尸。因此这里让夹具与测试共用
+一个会话级循环（配置见 pyproject 的 asyncio_default_*_loop_scope）。
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+from urllib.parse import urlparse
+
+import pytest
+
+# main.py 在导入时就执行 create_app()，而 create_app 会做启动自检：
+# 缺 JWT__SECRET_KEY 直接抛 RuntimeError（NFR-SEC-003）。测试进程不一定有 .env，
+# 这里在导入应用之前先兜一个测试专用密钥。
+# 用 setdefault 之外的行为是刻意的：环境变量优先级高于 .env，所以测试始终用这个
+# 密钥而不是开发者机器上的真实密钥，结果不随个人环境漂移。
+os.environ.setdefault("JWT__SECRET_KEY", "test-only-secret-do-not-use-in-production")
+
+TCP_PROBE_TIMEOUT_SECONDS = 1.0
+
+
+def _tcp_reachable(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=TCP_PROBE_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
+def missing_dependencies() -> dict[str, str]:
+    """返回 {依赖名: 不可用原因}；空字典表示全部就绪。"""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    missing: dict[str, str] = {}
+
+    for label, db in (("MySQL(meta)", settings.db_meta), ("MySQL(dw)", settings.db_dw)):
+        if not _tcp_reachable(db.host, db.port):
+            missing[label] = f"{db.host}:{db.port} 未监听"
+
+    qdrant_settings = settings.qdrant
+    if qdrant_settings.is_local:
+        pass  # 嵌入式模式不开端口，没有服务可探
+    elif not _tcp_reachable(qdrant_settings.host, qdrant_settings.port):
+        missing["Qdrant"] = f"{qdrant_settings.host}:{qdrant_settings.port} 未监听"
+
+    if not _tcp_reachable(settings.es.host, settings.es.port):
+        missing["Elasticsearch"] = f"{settings.es.host}:{settings.es.port} 未监听"
+
+    embedding_url = urlparse(settings.embedding.host)
+    hostname = embedding_url.hostname or "127.0.0.1"
+    port = embedding_url.port or (443 if embedding_url.scheme == "https" else 80)
+    if not _tcp_reachable(hostname, port):
+        missing["Embedding"] = f"{settings.embedding.host} 未监听"
+
+    return missing
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """外部依赖没起时，跳过（而非失败）需要真实服务栈的用例。"""
+    missing = missing_dependencies()
+    if not missing:
+        return
+    reason = "外部依赖未就绪，跳过：" + "、".join(
+        f"{name}（{detail}）" for name, detail in missing.items()
+    )
+    skip_marker = pytest.mark.skip(reason=reason)
+    for item in items:
+        if "requires_stack" in item.keywords:
+            item.add_marker(skip_marker)

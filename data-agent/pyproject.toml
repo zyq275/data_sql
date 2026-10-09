@@ -51,3 +51,12 @@ packages = ["app"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# 夹具与测试共用一个会话级事件循环：app.clients 下的 Qdrant / ES 客户端是按进程
+# 持有的单例，绑在创建它的事件循环上；每个测试各起一个循环会让单例在第二个测试里
+# 变成"绑在已关闭循环上"的僵尸。
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    # 需要 MySQL/Qdrant/Elasticsearch/Embedding 全部在跑；没起时自动跳过（见 tests/conftest.py）
+    "requires_stack: 需要完整外部服务栈（阶段 4 知识库验收）",
+]

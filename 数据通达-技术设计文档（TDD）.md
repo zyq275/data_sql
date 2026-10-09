@@ -693,7 +693,7 @@ RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决
 | 请求追踪 | 中间件 uuid 注入 ContextVar，loguru patch |
 | 链路追踪 | OpenTelemetry 采集，Langfuse 追踪 LLM 调用 |
 | 安全防护 | 见"安全设计" |
-| 健康探针 | /health 存活、/health/ready 检查 MySQL/Qdrant/Redis |
+| 健康探针 | /health 存活；/health/ready 逐项探测 MySQL(meta/dw)、Qdrant、ES、Embedding，任一不可用返 503（Redis 阶段 6 接入，先如实报 skipped） |
 | 优雅启停 | lifespan 中 init/close ClientManager |
 | 超时与重试 | LLM 超时+重试；SQL max_execution_time + 行数上限 |
 | 日志分级 | loguru 文件+控制台，rotation/retention 配置化 |

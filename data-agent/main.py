@@ -13,7 +13,10 @@ from fastapi import FastAPI
 from app.api.health import router as health_router
 from app.api.middleware import register_cors
 from app.api.v1.router import router as v1_router
+from app.clients.embedding import dispose_client as dispose_embedding
+from app.clients.es import dispose_es
 from app.clients.mysql import dispose_engine
+from app.clients.qdrant import dispose_qdrant
 from app.core.config import Settings, get_settings
 from app.core.handlers import register_exception_handlers
 
@@ -30,13 +33,16 @@ def check_security_settings(settings: Settings) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """优雅启停钩子。
 
-    MySQL 引擎按需惰性创建（app.clients.mysql），此处只负责停机释放；
-    Qdrant/ES/Redis 的生命周期在阶段 4/6 接入后一并纳入（TDD 第 10 章）。
+    各客户端都按需惰性创建（app.clients.*），此处只负责停机释放——连不上的
+    依赖不该拖住启动。Redis 在阶段 6 接入时一并纳入（TDD 第 10 章）。
     """
     settings = get_settings()
     print(f"[startup] {settings.app.name} v{settings.app.version} (debug={settings.app.debug})")
     yield
     await dispose_engine()
+    await dispose_qdrant()
+    await dispose_es()
+    await dispose_embedding()
     print("[shutdown] bye")
 
 

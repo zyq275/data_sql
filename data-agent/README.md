@@ -48,8 +48,13 @@ ADMIN_PASSWORD='<自定口令>' .venv/Scripts/python.exe -m app.scripts.init_adm
 
 - 服务地址：http://127.0.0.1:8000
 - 交互文档：http://127.0.0.1:8000/docs
-- 存活探针：`GET /health`
-- 就绪探针：`GET /health/ready`（依赖检查在阶段 4/6/7 接入）
+- 存活探针：`GET /health`（进程活着就 200，不碰外部依赖）
+- 就绪探针：`GET /health/ready`（逐项探测 MySQL meta/dw、Qdrant、ES、Embedding；
+  任一不可用返回 503，并列出每一项的状态与失败原因）
+
+就绪探针每项有独立超时（默认 3s，Embedding 10s——冷启动要加载权重）。
+探针挂起比探针失败更糟：编排器等不到结论，既不敢摘流量也不敢放流量。
+Redis 到阶段 6 才接入，当前如实报 `skipped` 而不是伪报 ok。
 
 ## 数据库迁移
 
@@ -65,6 +70,20 @@ CREATE DATABASE IF NOT EXISTS data_agent_meta
 .venv/Scripts/python.exe -m alembic upgrade head --sql   # 离线生成 SQL，不连库
 .venv/Scripts/python.exe -m alembic revision --autogenerate -m "..."  # 阶段 2 起使用
 ```
+
+## 测试
+
+```bash
+uv pip install -e ".[dev]"            # 测试依赖
+.venv/Scripts/python.exe -m pytest    # 全量
+```
+
+分两类：配置解析、探针骨架、口令脱敏这类**纯逻辑测试不需要任何外部服务**，
+随时可跑；涉及真实存储与知识库的用例标了 `requires_stack`，外部服务没起时
+**跳过并说明缺什么**，而不是失败——失败会掩盖真正的问题。
+
+跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
+那是真问题，测试必须失败，不会被跳过掩盖。
 
 ## 验证清单（阶段 1 验收）
 
@@ -105,6 +124,10 @@ CREATE DATABASE IF NOT EXISTS data_agent_meta
 召回这一条的口径是**召回@k，不是 top-1 精度**：阶段 4 交付的是索引，能保证正确项
 进入候选集；单路稠密向量分不开近义词（实测"销售额"会被排到"销量"之前），
 精排由阶段 6 的 RRF + rerank 负责，详见 TDD 8.3 的"已知限制"。
+
+四条标准已落成自动化用例：`pytest tests/test_meta_knowledge.py`（对应用例见 1/2/3/4
+四个分节）。入库一项不读构建脚本的输出，而是直接查 information_schema 与四张知识表
+后与配置声明逐项比对——脚本说"成功"不算数，存储里真的有才算。
 
 ## 元数据知识库构建（阶段 4）
 
