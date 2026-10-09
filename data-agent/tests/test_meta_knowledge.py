@@ -252,7 +252,7 @@ async def test_qdrant_vectors_are_not_degenerate(qdrant_client, settings) -> Non
 
 
 async def test_value_index_exists(es_client, settings) -> None:
-    assert await es_client.indices.exists(index=settings.es.index_name)
+    assert await es_client.indices.exists(index=settings.es.value_index)
 
 
 async def test_value_index_document_count_matches_distinct_values(
@@ -282,9 +282,9 @@ async def test_ik_analyzer_tokenizes_chinese(es_client, settings) -> None:
     ik 的词典版本会变，但"比逐字切分粗"这一点不会变。
     """
     probe = "华东区销售额"
-    ik = await es_client.indices.analyze(index=settings.es.index_name, analyzer="ik_smart", text=probe)
+    ik = await es_client.indices.analyze(index=settings.es.value_index, analyzer="ik_smart", text=probe)
     standard = await es_client.indices.analyze(
-        index=settings.es.index_name, analyzer="standard", text=probe
+        index=settings.es.value_index, analyzer="standard", text=probe
     )
     ik_tokens = [t["token"] for t in ik["tokens"]]
     standard_tokens = [t["token"] for t in standard["tokens"]]
@@ -298,10 +298,109 @@ async def test_ik_analyzer_tokenizes_chinese(es_client, settings) -> None:
 
 async def test_value_field_has_raw_keyword_subfield(es_client, settings) -> None:
     """value 带 raw 子字段才能做精确匹配，避免"广东省"被切碎后模糊命中。"""
-    mapping = await es_client.indices.get_mapping(index=settings.es.index_name)
-    properties = mapping[settings.es.index_name]["mappings"]["properties"]
+    mapping = await es_client.indices.get_mapping(index=settings.es.value_index)
+    properties = mapping[settings.es.value_index]["mappings"]["properties"]
 
     assert properties["value"]["fields"]["raw"]["type"] == "keyword"
+
+
+# ==========================================================================
+# 验收标准 3b：字段 / 指标的全文索引（阶段 6 的混合检索第二路）
+#
+# 阶段 4 只建了取值索引；阶段 6 的"两路召回"要求字段与指标也有全文这一路，
+# 所以构建脚本把它们一起建了，验收也一并落在这里——索引是构建的产物，
+# 它的完整性属于阶段 4 那份契约的延伸，不该等检索测试去发现"少了半个索引"。
+# ==========================================================================
+
+
+async def test_column_fulltext_index_covers_every_column(
+    es_client, settings, expected: dict[str, int]
+) -> None:
+    assert await es_client.indices.exists(index=settings.es.column_index)
+    actual = await es.index_count(settings.es.column_index)
+    assert actual == expected["columns"], (
+        f"字段全文索引有 {actual} 篇，配置声明 {expected['columns']} 个字段——"
+        "少一篇就意味着那个字段只剩向量一路可召回"
+    )
+
+
+async def test_metric_fulltext_index_covers_every_metric(
+    es_client, settings, expected: dict[str, int]
+) -> None:
+    assert await es_client.indices.exists(index=settings.es.metric_index)
+    actual = await es.index_count(settings.es.metric_index)
+    assert actual == expected["metrics"], (
+        f"指标全文索引有 {actual} 篇，配置声明 {expected['metrics']} 个指标"
+    )
+
+
+async def test_both_paths_see_the_identical_text(
+    es_client, qdrant_client, settings
+) -> None:
+    """两条路必须看到**逐字相同**的文本。
+
+    向量那一路把 ``text`` 向量化，全文那一路把同一段 ``text`` 做 ik 索引；
+    它们一旦分叉（比如只改了一边的拼装逻辑），融合与精排的依据就不再是同一份
+    内容，名次会对不上而**没有任何报错**——这是最难查的一类问题，所以钉死它。
+    """
+    column_id = (await es_client.search(index=settings.es.column_index, size=1))["hits"][
+        "hits"
+    ][0]["_source"]["column_id"]
+
+    es_doc = (await es_client.get(index=settings.es.column_index, id=column_id))["_source"]
+    points = (
+        await qdrant_client.retrieve(
+            collection_name=settings.qdrant.column_collection,
+            ids=[column_id],
+            with_payload=True,
+        )
+    )
+    assert points, f"Qdrant 字段集合里没有 {column_id}——两路的 id 必须一一对应"
+
+    assert es_doc["text"] == points[0].payload["text"], (
+        f"字段 {es_doc['column_name']} 的两路文本不一致：\n"
+        f"  ES    : {es_doc['text']}\n"
+        f"  Qdrant: {points[0].payload['text']}"
+    )
+
+
+COLUMN_TEXT_CASES = [
+    ("订单金额", "order_amount"),
+    ("省份", "province"),
+    ("商品类目", "category"),
+]
+
+METRIC_TEXT_CASES = [
+    # 口语词："销售额"只出现在 GMV 的描述里，全文这一路必须把它挑出来。
+    # 这正是单路向量做不到的那件事（TDD 8.3 记录的已知限制）。
+    ("销售额", "GMV"),
+    ("订单量", "order_count"),
+    ("活跃客户", "active_customer_count"),
+]
+
+
+@pytest.mark.parametrize(("keyword", "expected_column"), COLUMN_TEXT_CASES)
+async def test_column_fulltext_recall_hits_expected_column(
+    es_client, settings, keyword: str, expected_column: str
+) -> None:
+    resp = await es_client.search(
+        index=settings.es.column_index, query={"match": {"text": keyword}}, size=5
+    )
+    names = [hit["_source"]["column_name"] for hit in resp["hits"]["hits"]]
+    assert expected_column in names, f"字段全文检索「{keyword}」命中 {names}，期望含 {expected_column}"
+
+
+@pytest.mark.parametrize(("keyword", "expected_metric"), METRIC_TEXT_CASES)
+async def test_metric_fulltext_recall_hits_expected_metric(
+    es_client, settings, keyword: str, expected_metric: str
+) -> None:
+    resp = await es_client.search(
+        index=settings.es.metric_index, query={"match": {"text": keyword}}, size=3
+    )
+    names = [hit["_source"]["metric_name"] for hit in resp["hits"]["hits"]]
+    assert names and names[0] == expected_metric, (
+        f"指标全文检索「{keyword}」top3={names}，期望 top1={expected_metric}"
+    )
 
 
 async def test_dw_readonly_account_cannot_write(
@@ -400,7 +499,7 @@ async def test_value_fulltext_recall_finds_owning_column(
     es_client, settings, keyword: str, expected_column: str
 ) -> None:
     resp = await es_client.search(
-        index=settings.es.index_name, query={"match": {"value": keyword}}, size=5
+        index=settings.es.value_index, query={"match": {"value": keyword}}, size=5
     )
     columns = [hit["_source"]["column_name"] for hit in resp["hits"]["hits"]]
     assert expected_column in columns, f"取值「{keyword}」命中字段 {columns}，期望含 {expected_column}"
@@ -420,7 +519,7 @@ async def test_end_to_end_recall_covers_metric_field_and_value(
     ).points
     column_hits = await _top_column_names(qdrant_client, settings, question, limit=3)
     value_hits = await es_client.search(
-        index=settings.es.index_name, query={"match": {"value": "华东"}}, size=1
+        index=settings.es.value_index, query={"match": {"value": "华东"}}, size=1
     )
 
     metric_names = [hit.payload["metric_name"] for hit in metric_hits]

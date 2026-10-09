@@ -76,13 +76,26 @@ class StubLLM:
 
 
 class StubRetrieval:
-    async def columns(self, keywords):
+    """检索桩。
+
+    签名带 ``query`` 且是**必填**关键字参数：节点必须把消解后的问句交给检索层
+    （精排拿它当交叉编码器的查询），漏传就该在这里立刻报错，而不是等到线上
+    发现"精排结果莫名其妙"。
+    """
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def columns(self, keywords, *, query):
+        self.queries.append(query)
         return [Candidate(kind="column", id="c1", name="province", score=0.9)]
 
-    async def values(self, keywords):
+    async def values(self, keywords, *, query):
+        self.queries.append(query)
         return [Candidate(kind="value", id="v1", name="华东", score=0.8)]
 
-    async def metrics(self, keywords):
+    async def metrics(self, keywords, *, query):
+        self.queries.append(query)
         return [Candidate(kind="metric", id="m1", name="销售额", score=0.95)]
 
 

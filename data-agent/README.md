@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 5 单轮 Agent 闭环**。
+当前进度：**阶段 6 混合检索（两路召回 + RRF 融合 + rerank 精排）**。
 
 ## 环境要求
 
@@ -14,6 +14,9 @@ Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说�
   - **Elasticsearch 8.x + analysis-ik 插件** —— 版本必须完全一致
   - **Embedding HTTP 服务** —— 本项目用 Ollama 提供 bge-m3（ADR-005：不在应用内做本地推理）
 - 阶段 5 起还需要：**大模型服务**（OpenAI 兼容端点，默认 DeepSeek 云，需自备 API Key）
+- 阶段 6 可选：**Rerank 服务**（OpenAI 兼容的重排端点）。**没有也能跑**——
+  检索降级为 RRF 融合顺序，每一步照常；此时请设 `RERANK__ENABLED=false`，
+  否则每次查询都会打一条连不上的 WARNING
 - Node ≥ 20（前端独立目录 `../data-agent-frontend`）
 
 ## 首次准备
@@ -92,11 +95,14 @@ uv pip install -e ".[dev]"            # 测试依赖
 
 分三类：
 
-- **纯逻辑测试**（配置解析、探针骨架、口令脱敏、SQL 只读校验、图的拓扑与校正回边）
-  不需要任何外部服务，随时可跑；
+- **纯逻辑测试**（配置解析、探针骨架、口令脱敏、SQL 只读校验、图的拓扑与校正回边、
+  RRF 融合与重排客户端）不需要任何外部服务，随时可跑；
 - 涉及真实存储与知识库的用例标 `requires_stack`，外部服务没起时**跳过并说明缺什么**，
   而不是失败——失败会掩盖真正的问题；
-- 需要真调大模型的用例标 `requires_llm`，`.env` 里没配真实的 `LLM__API_KEY` 时跳过。
+- 需要真调大模型的用例标 `requires_llm`，`.env` 里没配真实的 `LLM__API_KEY` 时跳过；
+- 需要真调重排模型的用例标 `requires_rerank`，没配或连不上时跳过。它**不并进
+  `requires_stack`**：重排是可选依赖，把它算进"外部依赖"会把所有 requires_stack
+  的用例一并跳掉，比故障本身更糟。
 
 跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
 那是真问题，测试必须失败，不会被跳过掩盖。
@@ -173,7 +179,7 @@ NFR-SEC-007：写操作在机制上不可能发生）。记得把口令填进 `.
 样例数据用固定随机种子生成，日期区间截至运行当天，保证"去年""近三个月"这类
 相对时间问法有数据可查。
 
-### 2. 准备三个外部服务
+### 2. 准备外部服务
 
 **Embedding（必须）** —— Ollama 起 bge-m3，并让 `.env` 的 `EMBEDDING__HOST`
 指向其 OpenAI 兼容根路径：
@@ -223,17 +229,31 @@ QDRANT__LOCAL_PATH=D:\agent\infra\qdrant-local-data
 嵌入式模式与 server 模式 API 一致，业务代码不感知差异；区别只是 payload 索引
 不生效（只影响按字段过滤的性能，过滤语义不变），且数据落在本地目录。
 
+**Rerank（可选，阶段 6）** —— 任何返回 `[{index, score}]` 或
+`{"results":[{index, relevance_score}]}` 的重排端点都能接，改 `.env` 的
+`RERANK__HOST` / `RERANK__PATH` / `RERANK__MODEL` 即可（云服务的 Key 填
+`RERANK__API_KEY`）。**没部署就不要留着默认值**：
+
+```
+RERANK__ENABLED=false
+```
+
+否则每次查询都会因连不上而打一条 WARNING。功能不受影响（降级为 RRF 顺序），
+但日志会脏。
+
 ### 3. 构建
 
 ```bash
 .venv/Scripts/python.exe -m app.scripts.build_meta                  # 全量重建 MySQL + Qdrant + ES
-.venv/Scripts/python.exe -m app.scripts.build_meta --no-value-index # 只重建 MySQL + Qdrant
+.venv/Scripts/python.exe -m app.scripts.build_meta --no-text-index  # 只重建 MySQL + Qdrant
 .venv/Scripts/python.exe -m app.scripts.build_meta --embed-only     # 配置没变，只重建向量
 ```
 
-构建是**全量重建**：先清空四张知识表与两个集合、索引再写入。MySQL 主键由
-`uuid5(命名空间, 自然键)` 确定性生成，Qdrant 点 id 与 ES 文档 id 直接复用同一个
-id，因此重建后 id 不变（`permission.resource_id` 不会失效），也不会产生副本。
+构建是**全量重建**：先清空四张知识表、两个向量集合与三个 ES 索引再写入。
+MySQL 主键由 `uuid5(命名空间, 自然键)` 确定性生成，Qdrant 点 id 与 ES 文档 id
+直接复用同一个 id，因此重建后 id 不变（`permission.resource_id` 不会失效），
+也不会产生副本。三个索引是 `data-agent-value`（取值）、`data-agent-column-text`
+与 `data-agent-metric-text`（阶段 6 的全文两路，索引名可配，见 TDD 11）。
 
 结束后会做入库自检——核对"配置声明"与"实际入库"的行数，不一致直接失败。
 
@@ -319,6 +339,60 @@ curl -N -X POST http://127.0.0.1:8000/api/v1/query \
 恶意/错误 SQL，而不是指望真实模型主动生成写语句——指望它触发安全闸门，
 等于这道闸门没被测过。第 1、2 条必须真调大模型，否则验的是桩不是链路。
 
+## 混合检索（阶段 6）
+
+字段与指标各走两路，融合成一路（TDD 5.2）；取值只走全文一路——"华东"是字面匹配，
+给取值配向量只会引入误召回：
+
+```
+关键词 ─┬─ Embedding → Qdrant 向量检索 ─┐
+        │                               ├─ RRF 融合 → Rerank 精排 → 候选
+        └─ ES 全文检索（ik）───────────┘
+```
+
+| 文件 | 职责 |
+|---|---|
+| `retrievers/dense.py` | Qdrant 向量检索（每路取 10 条） |
+| `retrievers/fulltext.py` | ES `match` 全文检索（每路取 10 条） |
+| `retrievers/fusion.py` | RRF 融合，纯函数无 IO |
+| `retrievers/candidate.py` | 两路共用候选，`identity() = (kind, id, name)` 是合并依据 |
+| `retrievers/retrieval.py` | 网关：并发两路 → 融合 → 截断 20 条 → 精排 |
+
+**为什么要 RRF 而不是加权求和**：向量分是余弦（0~1），BM25 分无上界且随语料漂移，
+两者量纲不可比，任何固定权重都只是在某个语料上拟合出来的。RRF 只用名次：
+
+```
+score(d) = Σ 1 / (60 + rank_i(d))     # rank 从 1 起
+```
+
+k=60 时第 1 名与第 2 名只差 ≈0.0003，而另一路投的一票 ≥1/61≈0.0164——
+**任何两路共识的命中都压过任何单路命中**，这正是融合与"把两个列表拼起来"的分界。
+
+**两路看到的是同一段文本**：建库时把拼好的文本同时写进 Qdrant payload 的 `text`
+和 ES 的 `text`，doc id 两处都用 MySQL 主键。合并靠 id 直接进行，精排也直接取这段
+原文，不必在检索侧重拼（否则"排的依据"与"召的依据"会悄悄分叉）。
+
+**rerank 是可选依赖**。未配置或调用失败时降级为 RRF 顺序，每进程只告警一次
+（恢复后标志复位，下次故障会再提醒）。降级而不是报错：精排只影响排序质量，
+不影响是否有结果。两种响应协议（`[{index,score}]` 与 `{"results":[{index,relevance_score}]}`）
+在 `app/clients/rerank.py` 里归一化，`top_n` / `path` / `api_key` 可配（TDD 11）。
+
+**本阶段唯一可量化的质量提升**：单路向量至今把"销售额"排给 `sales_quantity`（销量）
+而非 `GMV`（TDD 8.3 记录的近同义词问题）；指标的 description 里写着"口语常称销售额、
+营收"，全文那一路据此召回 GMV，融合后 GMV 回到第一。
+
+## 验证清单（阶段 6 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 两路召回结果经 RRF 融合 | `pytest tests/test_stage6_acceptance.py -v -s`：逐条候选核对融合分是否等于两路名次倒数之和，并断言共识命中排在单路命中之前 |
+| rerank 精排后相关项位于不相关项之前 | 同上：用本地桩重排服务（按文档内容打分）断言网关确实按精排分数重排；桩也记录了送到服务端的文档，比对建库原文 |
+| 召回命中率达标 | 同上：19 条语料（指标 5 / 字段 7 / 取值 5）实测召回@3 与 top-1 均为 100%，门槛为 100% / 85% |
+
+第一条与第三条必须真跑两路索引（`pytest -m requires_stack`）；第二条用桩服务，
+因为本环境没有重排服务，而"用桩测出模型排得对"是自欺。真实精排质量由
+`-m requires_rerank` 的用例覆盖（配了服务才会跑），最终由阶段 10 的评测集度量。
+
 ## 目录结构
 
 ```
@@ -334,7 +408,7 @@ data-agent/
 │   ├── api/                   接口层：middleware / health / v1 路由
 │   ├── agent/                 智能体层：graph、state、context、events、llm、
 │   │                          prompts、parsing、knowledge、rendering、nodes/
-│   ├── retrievers/            retrieval.py 是阶段 6 混合检索的唯一替换点
+│   ├── retrievers/            dense / fulltext / fusion / candidate + retrieval 网关
 │   ├── clients/               外部连接生命周期管理
 │   ├── repositories/          数据访问层（meta 注入式会话；dw 自开只读连接）
 │   ├── entities/              领域实体

@@ -45,10 +45,19 @@ embedding:
   model: bge-m3
   timeout: 30
 
+# 重排服务。重排不属于 OpenAI 兼容协议，各家路径与响应字段都不一致，
+# 所以 path 单独可配：TEI / Xinference / vLLM 是 /rerank，
+# SiliconFlow、Jina 等云服务是 /v1/rerank。云服务需要鉴权的，
+# 用环境变量 RERANK__API_KEY 注入（敏感项不进本文件，NFR-SEC-003）。
+# 没有重排服务时把 enabled 设为 false（或 RERANK__ENABLED=false）：
+# 检索会自动退回 RRF 融合顺序，而不是让每次问答都白等一轮超时。
 rerank:
+  enabled: true
   host: http://127.0.0.1:8002
+  path: /rerank
   model: bge-reranker-v2-m3
   timeout: 30
+  top_n: 0
 
 jwt:
   algorithm: HS256
@@ -67,11 +76,16 @@ qdrant:
   column_collection: data-agent-column
   metric_collection: data-agent-metric
 
+# 三个索引各管一类（阶段 6 起）：取值、字段、指标。
+# 字段/指标的全文索引是混合检索的第二路，与 Qdrant 的
+# data-agent-column / data-agent-metric 两个集合一一对应。
 es:
   scheme: http
   host: 127.0.0.1
   port: 9200
-  index_name: data-agent-value
+  value_index: data-agent-value
+  column_index: data-agent-column-text
+  metric_index: data-agent-metric-text
 
 redis:
   host: 127.0.0.1

@@ -91,9 +91,18 @@ async def _check_es() -> str:
     client = es.get_es()
     if not await client.ping():
         raise RuntimeError("ping 返回 False")
-    if await client.indices.exists(index=settings.es.index_name):
-        return f"{settings.es.url} 可达，索引 {settings.es.index_name} 已建"
-    return f"{settings.es.url} 可达，索引 {settings.es.index_name} 未建"
+    missing = [
+        index
+        for index in (settings.es.value_index, settings.es.column_index, settings.es.metric_index)
+        if not await client.indices.exists(index=index)
+    ]
+    built = 3 - len(missing)
+    if missing:
+        # 服务可达但索引没建：连通性没问题，不判失败（建库是独立的运维动作，
+        # 由 build_meta 负责）。但要把缺哪几个如实报出来——少一个索引，
+        # 对应的那条召回就只剩一路，现象是"结果质量下降"，很难反向查到探针。
+        return f"{settings.es.url} 可达，索引已建 {built}/3，缺：{'、'.join(missing)}"
+    return f"{settings.es.url} 可达，索引 3/3 已建"
 
 
 async def _check_embedding() -> str:

@@ -40,7 +40,10 @@ dependencies = [
 ]
 
 # 以下依赖按开发阶段逐步启用（见《开发步骤文档》），避免过早引入未使用的重依赖：
-#   阶段 6  混合检索    : redis[hiredis]、jieba（关键字分词）
+#   阶段 6  混合检索    : 无需新增依赖——向量检索用 qdrant-client，全文检索用
+#                        elasticsearch，重排走 httpx（均为已有依赖）。
+#                        重排**服务**是独立进程，不装进本环境（ADR-005）
+#   阶段 7  多轮会话    : redis[hiredis]
 #   阶段 11 可观测      : loguru, opentelemetry-sdk, opentelemetry-instrumentation-fastapi, langfuse
 
 [project.optional-dependencies]
@@ -70,4 +73,8 @@ markers = [
     "requires_stack: 需要完整外部服务栈（阶段 4 知识库验收）",
     # 需要 .env 里配好真实的 LLM__API_KEY；没配时自动跳过（见 tests/conftest.py）
     "requires_llm: 需要真实大模型服务（阶段 5 端到端验收）",
+    # 需要 RERANK__HOST 指向一个真实的重排服务；没起时自动跳过。
+    # 重排是可选依赖（没有它检索降级到 RRF 顺序），所以单独一个标记，
+    # 不混进 requires_stack
+    "requires_rerank: 需要真实重排服务（阶段 6 精排质量验收）",
 ]

@@ -53,7 +53,14 @@ def _tcp_reachable(host: str, port: int) -> bool:
 
 
 def missing_dependencies() -> dict[str, str]:
-    """返回 {依赖名: 不可用原因}；空字典表示全部就绪。"""
+    """返回 {依赖名: 不可用原因}；空字典表示全部就绪。
+
+    **不含重排服务**：它是可选的。没有它，检索会降级到 RRF 融合顺序
+    （见 retrievers.retrieval 的说明），整条问答链路照常工作，
+    所以它不该出现在"外部依赖未就绪就跳过"的名单里——那会把所有
+    requires_stack 的用例一并跳掉，比故障本身更糟。
+    需要真实精排模型的用例单独用 requires_rerank 标记（见 rerank_available）。
+    """
     from app.core.config import get_settings
 
     settings = get_settings()
@@ -95,6 +102,19 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip_marker)
 
 
+def rerank_available() -> bool:
+    """重排服务是否可用（开关打开、配了地址、端口在监听）。"""
+    from app.core.config import get_settings
+
+    settings = get_settings().rerank
+    if not settings.enabled or not settings.host:
+        return False
+    url = urlparse(settings.host)
+    hostname = url.hostname or "127.0.0.1"
+    port = url.port or (443 if url.scheme == "https" else 80)
+    return _tcp_reachable(hostname, port)
+
+
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """没配真实 LLM Key 时跳过需要真模型调用的用例。
 
@@ -103,3 +123,9 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     """
     if "requires_llm" in item.keywords and not HAS_REAL_LLM:
         pytest.skip("未配置真实的 LLM__API_KEY（.env），跳过需要调用大模型的用例")
+    if "requires_rerank" in item.keywords and not rerank_available():
+        pytest.skip(
+            "没有可用的 Rerank 服务（RERANK__HOST 未监听或已关闭），"
+            "跳过需要真实精排模型的用例——精排机制的用例另在 test_hybrid_retrieval "
+            "与 test_stage6_acceptance 里用桩服务覆盖"
+        )

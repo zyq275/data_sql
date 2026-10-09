@@ -1,21 +1,27 @@
-"""元数据知识库离线构建（阶段 4，TDD 第 5 章的知识构建层）。
+"""元数据知识库离线构建（阶段 4 建库，阶段 6 补齐字段/指标的全文索引）。
 
     python -m app.scripts.build_meta                # 全量重建 MySQL + Qdrant + ES
     python -m app.scripts.build_meta --no-vector    # 只重建 MySQL 与 ES
-    python -m app.scripts.build_meta --no-value-index   # 只重建 MySQL 与 Qdrant
+    python -m app.scripts.build_meta --no-text-index    # 只重建 MySQL 与 Qdrant
     python -m app.scripts.build_meta --embed-only   # 只重建 Qdrant（配置未变时最快）
 
 流程：
     1. 读 conf/meta_config.yaml，校验（外键指向、指标口径、重名）
     2. 解析外键与指标相关字段 -> 生成确定性 id -> 写入 MySQL 四张知识表
     3. 字段/指标的 name+alias+description 向量化 -> 写入 Qdrant 两个集合
-    4. 标记 sync_values 的字段，从 dw 取不重复取值 -> 写入 ES 取值索引
-    5. 核对「配置声明」与「实际入库」是否一致，不一致直接失败
+    4. 同一段文本再写进 ES 的字段/指标全文索引（混合检索的第二路）
+    5. 标记 sync_values 的字段，从 dw 取不重复取值 -> 写入 ES 取值索引
+    6. 核对「配置声明」与「实际入库」是否一致，不一致直接失败
 
 设计取舍：
   - 中文检索文本拼装时把别名放在最前。用户问的是"订单金额"而不是"order_amount"，
     别名与描述才是语义主体，字段名只是补充信号。
+  - **同一段拼好的文本写两处**：Qdrant 的 ``text`` payload 与 ES 的 ``text`` 字段。
+    两路召回据此看到完全相同的内容，融合与精排的依据一致；精排也直接取这段文本，
+    不必在检索侧重新拼一遍（否则"排的依据"和"召的依据"会悄悄分叉）。
   - 取值索引的文档按 (字段, 取值) 做 md5 作为 id，重复构建覆盖同一文档，不会产生副本。
+  - 全文索引 doc id 一律用 MySQL 主键 uuid：与 Qdrant 点 id 同一套，
+    两路命中的同一条实体能凭 id 直接合并，不需要额外的映射表。
   - Embedding 走 HTTP 独立服务（ADR-005），本脚本不加载任何本地模型。
 """
 
@@ -215,6 +221,8 @@ async def write_qdrant(loader: MetaConfigLoader) -> dict[str, int]:
                 "column_type": column.column_type,
                 "description": column.description,
                 "is_dimension": table.is_dimension,
+                # 被向量化的原文，供精排当文档用（见模块说明）
+                "text": texts[cid],
             }
 
     ids = list(texts)
@@ -232,8 +240,9 @@ async def write_qdrant(loader: MetaConfigLoader) -> dict[str, int]:
     m_payloads: list[dict] = []
     for metric in loader.config.metrics:
         mid = metric_id(metric.metric_name)
+        text = metric_text(metric)
         m_ids.append(mid)
-        m_texts.append(metric_text(metric))
+        m_texts.append(text)
         m_payloads.append(
             {
                 "metric_name": metric.metric_name,
@@ -245,6 +254,7 @@ async def write_qdrant(loader: MetaConfigLoader) -> dict[str, int]:
                 "relevant_columns": [
                     {"table": t, "column": c} for _db, t, c in loader.resolve_metric_columns(metric)
                 ],
+                "text": text,
             }
         )
     m_vectors = await embedding.embed_texts(m_texts)
@@ -277,6 +287,7 @@ async def write_value_index(loader: MetaConfigLoader) -> int:
     """把需要同步的字段取值写入 ES 取值索引（ik 分词）。"""
     settings = get_settings()
     sync_columns = loader.sync_columns()
+    index = settings.es.value_index
     await es.ensure_value_index(recreate=True)
 
     if not sync_columns:
@@ -285,9 +296,6 @@ async def write_value_index(loader: MetaConfigLoader) -> int:
 
     # 取值从 dw 只读账号读取：这是运行期查询用的账号，顺带验证它确实可用（ADR-008）
     dw = create_async_engine(settings.db_dw.url, pool_pre_ping=True)
-    client = es.get_es()
-    index = settings.es.index_name
-    total = 0
     try:
         async with dw.connect() as conn:
             for db, table, column in sync_columns:
@@ -303,10 +311,9 @@ async def write_value_index(loader: MetaConfigLoader) -> int:
                     continue
 
                 cid = column_id(db.db_name, table.table_name, column.column_name)
-                ops: list[dict] = []
-                for value in values:
-                    ops.append({"index": {"_index": index, "_id": es.value_doc_id(cid, value)}})
-                    ops.append(
+                docs = [
+                    (
+                        es.value_doc_id(cid, value),
                         {
                             "column_id": cid,
                             "db_name": db.db_name,
@@ -314,26 +321,89 @@ async def write_value_index(loader: MetaConfigLoader) -> int:
                             "column_name": column.column_name,
                             "column_alias": column.column_alias,
                             "value": value,
-                        }
+                            "text": es.value_text(column.column_name, column.column_alias, value),
+                        },
                     )
-                resp = await client.bulk(operations=ops)
-                if resp.get("errors"):
-                    reasons = [
-                        it["index"]["error"]["reason"]
-                        for it in resp["items"]
-                        if "error" in it.get("index", {})
-                    ][:3]
-                    raise RuntimeError(f"取值索引入库失败：{reasons}")
-                total += len(values)
+                    for value in values
+                ]
+                await _index_docs(index, docs)
                 print(f"[OK] 取值 {table.table_name}.{column.column_name}: {len(values)} 条")
     finally:
         await dw.dispose()
 
-    # bulk 是近实时的，refresh 后才能立刻 count/search 到
-    await client.indices.refresh(index=index)
-    count = await es.index_count()
+    await es.refresh(index)
+    count = await es.index_count(index)
     print(f"[OK] ES 取值索引 {index} 共 {count} 篇文档")
     return count
+
+
+async def write_column_index(loader: MetaConfigLoader) -> int:
+    """把字段全文写入 ES（混合检索的第二路）。
+
+    文档内容与 Qdrant 里被向量化的那段文本逐字相同（``column_text``），
+    doc id 也用同一个字段 uuid——两路命中的同一条实体凭 id 即可合并。
+    """
+    index = get_settings().es.column_index
+    await es.ensure_column_index(recreate=True)
+    docs = [
+        (
+            column_id(db.db_name, table.table_name, column.column_name),
+            {
+                "column_id": column_id(db.db_name, table.table_name, column.column_name),
+                "db_name": db.db_name,
+                "table_name": table.table_name,
+                "table_alias": table.table_alias,
+                "column_name": column.column_name,
+                "column_alias": column.column_alias,
+                "description": column.description,
+                "text": column_text(db.db_name, table, column),
+            },
+        )
+        for db, table in loader.tables()
+        for column in table.columns
+    ]
+    return await _index_docs(index, docs, label="字段全文索引")
+
+
+async def write_metric_index(loader: MetaConfigLoader) -> int:
+    """把指标全文写入 ES（混合检索的第二路）。"""
+    index = get_settings().es.metric_index
+    await es.ensure_metric_index(recreate=True)
+    docs = [
+        (
+            metric_id(metric.metric_name),
+            {
+                "metric_id": metric_id(metric.metric_name),
+                "metric_name": metric.metric_name,
+                "metric_alias": metric.metric_alias,
+                "description": metric.description,
+                "text": metric_text(metric),
+            },
+        )
+        for metric in loader.config.metrics
+    ]
+    return await _index_docs(index, docs, label="指标全文索引")
+
+
+async def _index_docs(index: str, docs: list[tuple[str, dict]], *, label: str = "取值") -> int:
+    """批量写文档并 refresh，返回写入条数。
+
+    bulk 是近实时的：不 refresh 的话紧接着的 count/search 看不到刚写的文档，
+    构建脚本的收尾自检会误报"少了 N 篇"。逐批 refresh 会拖慢构建，但取值索引
+    是分批写的、每批都要立刻核对，所以放在这里而不是全部写完之后。
+    """
+    if not docs:
+        print(f"[WARN] {label} {index} 没有任何文档可写")
+        return 0
+
+    operations: list[dict] = []
+    for doc_id, source in docs:
+        operations.append({"index": {"_index": index, "_id": doc_id}})
+        operations.append(source)
+
+    await es.bulk_write(index, operations)
+    await es.refresh(index)
+    return len(docs)
 
 
 async def self_check(loader: MetaConfigLoader, mysql_counts: dict[str, int]) -> None:
@@ -366,7 +436,7 @@ async def self_check(loader: MetaConfigLoader, mysql_counts: dict[str, int]) -> 
 # --------------------------------------------------------------------------
 
 
-async def build(*, with_vector: bool, with_value_index: bool, embed_only: bool) -> None:
+async def build(*, with_vector: bool, with_text_index: bool, embed_only: bool) -> None:
     loader = load_meta_config()
     print(
         f"[..] 配置已加载并通过校验："
@@ -379,24 +449,32 @@ async def build(*, with_vector: bool, with_value_index: bool, embed_only: bool) 
     mysql_counts = await write_mysql(build_mysql_rows(loader), embed_only=embed_only)
     if with_vector:
         await write_qdrant(loader)
-    if with_value_index:
+    if with_text_index:
         await write_value_index(loader)
+        await write_column_index(loader)
+        await write_metric_index(loader)
     await self_check(loader, mysql_counts)
 
 
 async def main_async(args: argparse.Namespace) -> int:
     await build(
         with_vector=not args.no_vector,
-        with_value_index=not args.no_value_index,
+        with_text_index=not args.no_text_index,
         embed_only=args.embed_only,
     )
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="构建元数据知识库（阶段 4）")
+    parser = argparse.ArgumentParser(description="构建元数据知识库（阶段 4 建库，阶段 6 补全文索引）")
     parser.add_argument("--no-vector", action="store_true", help="跳过 Qdrant 向量构建")
-    parser.add_argument("--no-value-index", action="store_true", help="跳过 ES 取值索引构建")
+    parser.add_argument(
+        "--no-text-index",
+        "--no-value-index",  # 阶段 4 的旧名，保留以免既有的脚本/说明失效
+        dest="no_text_index",
+        action="store_true",
+        help="跳过 ES 全文索引构建（取值 / 字段 / 指标）",
+    )
     parser.add_argument("--embed-only", action="store_true", help="跳过 MySQL 写入，只重建向量")
     args = parser.parse_args(argv)
 

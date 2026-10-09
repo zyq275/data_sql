@@ -110,7 +110,7 @@ data-agent/                        # 后端
 │   │   ├── knowledge.py           # 表/字段/指标口径获取
 │   │   ├── rendering.py           # 上下文拼装（表结构/指标/日期/库环境）
 │   │   └── nodes/*.py             # 各节点
-│   ├── retrievers/                # 检索层（retrieval.py 为阶段 6 混合检索的替换点）
+│   ├── retrievers/                # 检索层：dense/fulltext/fusion/candidate + retrieval 网关
 │   ├── clients/                   # 连接管理器
 │   ├── repositories/              # 数据访问层（meta 注入式会话；dw 自开只读连接）
 │   ├── entities/                  # 领域实体
@@ -141,7 +141,9 @@ data-agent-frontend/               # 前端
 | agent.events / rendering / parsing / prompts | 事件构造、上下文拼装、模型输出解析、提示词装载 |
 | core.sql_security | SQL 只读校验（白名单解析 + 关键词黑名单） |
 | repositories.dw | 数仓只读执行与三重限制 |
-| retrievers.* | 混合检索、RRF 融合、rerank |
+| retrievers.dense / fulltext | 单路检索（Qdrant 向量 / ES 全文） |
+| retrievers.fusion | RRF 融合（纯函数，无 IO） |
+| retrievers.retrieval | 检索网关：并发两路 → 融合 → 精排 → 候选（节点只依赖它） |
 | clients.* | 外部连接生命周期 |
 | repositories.* | 存储访问封装 |
 | services.* | 业务编排 |
@@ -240,6 +242,56 @@ recall_column        recall_value                  recall_metric
         │                                      ├──→ RRF 融合 → Rerank 精排 → 最终召回
         └──→ ES 全文检索（ik 分词）─────────────┘
 ```
+
+#### 5.2.1 实现说明（阶段 6）
+
+三个阶段各自独立成文件，节点只认最后的网关，不知道中间有几路：
+
+| 文件 | 职责 |
+| --- | --- |
+| `retrievers/dense.py` | Qdrant 向量检索，每个关键词一次查询，同一实体取最高分 |
+| `retrievers/fulltext.py` | ES `match` 全文检索（索引级 `ik_max_word`，查询级 `ik_smart`） |
+| `retrievers/fusion.py` | RRF 融合，纯函数，无 IO |
+| `retrievers/candidate.py` | 两路共用的候选结构，`identity() = (kind, id, name)` 是合并与去重的唯一依据 |
+| `retrievers/retrieval.py` | 网关：并发跑两路 → 融合 → 截断 → 精排；节点只调这里 |
+
+**为什么必须是 RRF 而不是加权求和。** 向量分是余弦相似度（0~1），BM25 分无上界且
+随语料长度漂移，两路的分数量纲根本不可比，任何固定的加权系数都只是在某一个语料上
+拟合出来的。RRF 只用名次：
+
+```
+score(d) = Σ_i  1 / (k + rank_i(d))        k = 60，rank 从 1 起
+```
+
+k=60 是刻意的：此时第 1 名与第 2 名只差 `1/61 - 1/62 ≈ 0.0003`，而另一路投出的一票
+至少值 `1/61 ≈ 0.0164`——**任何两路共识的命中都必然压过任何单路命中**，无论单路里
+它领先多少。这正是"融合"与"把两个列表拼起来"的区别，验收用例
+（`test_a_consensus_hit_outranks_a_single_path_hit_on_real_indexes`）钉的就是这条。
+
+**两路看到的是同一段文本。** 建库时把拼好的文本同时写进 Qdrant 的 `text` payload 与
+ES 的 `text` 字段，doc id 两处都用 MySQL 的 uuid 主键。于是：合并靠 id 直接进行，
+不需要映射表；精排的文档直接取这段原文，不必在检索侧重新拼一遍——否则"排的依据"
+和"召的依据"会悄悄分叉，名次对不上且无从解释。
+
+**精排是可选的，缺了不阻断。** 重排服务是独立进程（ADR-005），本环境未必部署。
+未配置或调用失败时降级为 RRF 顺序，每个进程只打一条 WARNING（避免每问一次日志刷屏），
+恢复成功后标志位复位、下次故障会再提醒一次。降级而不是报错，是因为精排只影响
+排序质量、不影响是否有结果；把"没有重排服务"变成查询失败，代价与收益不成比例。
+
+**两种重排协议在客户端归一化**（`clients/rerank.py`），上层不必关心用的是谁：
+
+| 服务 | 响应形状 |
+| --- | --- |
+| TEI / Xinference / vLLM | `[{"index": 0, "score": 0.9}, ...]` |
+| SiliconFlow / Jina | `{"results": [{"index": 0, "relevance_score": 0.9}]}` |
+
+请求体统一为 `{"model", "query", "documents", "top_n"}`。4xx 立即失败（重试不会变好），
+5xx 与网络错误重试 2 次后再失败。
+
+**已知局限与归属**：向量那一路至今仍把"销售额"排给 `sales_quantity` 而非 `GMV`
+（§8.3 记录的近同义词问题），融合后 GMV 回到第一——这是本阶段唯一可量化的质量提升，
+由 `test_the_fulltext_path_fixes_the_near_synonym_case` 钉住。至于重排模型本身的排序
+质量，桩服务只能证明机制通了，真实效果由阶段 10 的评测集度量。
 
 ### 5.3 多轮会话流程
 
@@ -661,23 +713,34 @@ CREATE TABLE fact_order (
 
 ### 8.3 向量库与全文索引
 
-| 存储 | 集合/索引 | 内容 |
-|---|---|---|
-| Qdrant | data-agent-column | 字段向量 |
-| Qdrant | data-agent-metric | 指标向量 |
-| Elasticsearch | data-agent-value | 取值全文索引 |
+| 存储 | 集合/索引 | 内容 | 检索方式 |
+|---|---|---|---|
+| Qdrant | data-agent-column | 字段向量 | 语义（余弦） |
+| Qdrant | data-agent-metric | 指标向量 | 语义（余弦） |
+| Elasticsearch | data-agent-column-text | 字段全文（阶段 6 新增） | BM25（ik 分词） |
+| Elasticsearch | data-agent-metric-text | 指标全文（阶段 6 新增） | BM25（ik 分词） |
+| Elasticsearch | data-agent-value | 取值全文索引 | BM25（ik 分词） |
+
+字段与指标各有一个全文索引（与各自的向量集合配对，构成 §5.2 的两路），
+取值只有全文一路——取值是精确的字面匹配，"华东"不需要语义近似，
+给它配向量只会引入误召回。故 ADR-002 的"三路并行"在阶段 6 展开为：
+字段两路、指标两路、取值一路，共五条检索路径。
 
 **点/文档 id 与 MySQL 主键一致**：MySQL 侧 `table_info.id` / `column_info.id` /
 `metric_info.id` 由 `uuid5(命名空间, 自然键)` 确定性生成，Qdrant 点 id 与 ES 文档 id
-直接复用同一个 id。因此三个存储天然一一对应，召回结果无需再做 id 映射，
-重复构建也不会产生副本或孤儿数据。
+直接复用同一个 id。因此各存储天然一一对应，两路结果凭 id 直接合并、无需映射表，
+重复构建也不会产生副本或孤儿数据。取值索引是唯一例外：它的文档是"取值"而不是
+"字段"，id 取 `md5(字段 id + 取值)`，同一 (字段, 取值) 重建时覆盖同一文档。
+索引名可在配置里改（`es.value_index` / `es.column_index` / `es.metric_index`）。
 
 **向量化文本**（决定召回质量，改动前先想清楚检索侧会怎么问）：
 
 - 字段：`别名（字段名）。所属表：<表别名>。<描述>[。外键，关联 x.y]`
 - 指标：`别名（指标名）。<描述>。计算方式：<calculation>。过滤条件：<filter_condition>`
 
-别名放在最前，因为用户问的是"订单金额"而不是 `order_amount`。
+别名放在最前，因为用户问的是"订单金额"而不是 `order_amount`。这段文本**原样**
+存进 Qdrant payload 的 `text` 与 ES 文档的 `text`（字段索引的取值文本为
+`别名（字段名）：取值`），检索侧不再重新拼装（理由见 §5.2.1）。
 
 **ES 索引 mapping**：索引期用 `ik_max_word`（多切词，提高命中率），检索期用
 `ik_smart`（粗粒度，避免把用户输入切碎导致误召回）；`value` 字段带 `raw`
@@ -696,6 +759,14 @@ CREATE TABLE fact_order (
 （上例中 GMV 稳定排第 2），精排是阶段 6 的职责。这类近义混淆需要
 阶段 5 的 LLM 关键词抽取把"销售额"显式归到 GMV 指标，以及阶段 6 的
 RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决。
+
+**阶段 6 实测结局**：这个限制已由融合纠正，且**不是**靠换模型或调索引文本——
+上面那段描述里的"口语常称销售额、营收、卖了多少钱"本来就是 BM25 的命中点，
+全文那一路靠它召回了 GMV，融合后 GMV 回到第一。单路向量至今仍把
+`sales_quantity` 排第一（用时例钉住），说明纠正确实来自第二路。
+`test_the_fulltext_path_fixes_the_near_synonym_case` 监控这条；若哪天单路向量的
+top-1 自己变了，用例会失败并要求同步更新本节——避免"限制其实已经不存在了"
+被一句过期的说明继续写在文档里。
 
 ---
 
@@ -721,6 +792,10 @@ RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决
 
 ### ADR-007 混合检索采用 RRF + rerank
 - **理由**：RRF 无需调权、对异构分数鲁棒；rerank 交叉编码提升排序精度。
+- **阶段 6 补充**：两路结果只在名次层面融合（`k=60`，共识压过单路，见 §5.2.1）。
+  rerank **是可选依赖**：它只影响排序质量、不影响是否有结果，所以未配置或故障时
+  降级为 RRF 顺序并每进程告警一次，而不是让整条问答链路失败。重排服务是独立进程
+  （同 ADR-005），本环境无 GPU 时可不部署。
 
 ### ADR-008 SQL 安全采用白名单解析 + 只读账号
 - **理由**：黑名单可被混淆绕过，白名单（sqlparse 解析 + 只读账号 + 最小权限）从机制上杜绝写操作。
@@ -734,7 +809,7 @@ RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决
 | 请求追踪 | 中间件 uuid 注入 ContextVar，loguru patch |
 | 链路追踪 | OpenTelemetry 采集，Langfuse 追踪 LLM 调用 |
 | 安全防护 | 见"安全设计" |
-| 健康探针 | /health 存活；/health/ready 逐项探测 MySQL(meta/dw)、Qdrant、ES、Embedding，任一不可用返 503（Redis 阶段 6 接入，先如实报 skipped） |
+| 健康探针 | /health 存活；/health/ready 逐项探测 MySQL(meta/dw)、Qdrant、ES、Embedding，任一不可用返 503（Redis 阶段 7 接入，先如实报 skipped）。ES 一项只在三个索引齐备时算就绪，但缺索引不判 failed——它属于"没建库"而非"服务故障"，如实报"已建 N/3"更利于定位；Rerank 是可选依赖，不参与就绪判定 |
 | 优雅启停 | lifespan 中 init/close ClientManager |
 | 超时与重试 | LLM 超时+重试；SQL max_execution_time + 行数上限 |
 | 日志分级 | loguru 文件+控制台，rotation/retention 配置化 |
@@ -750,11 +825,13 @@ RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决
 | db_meta / db_dw | host/port/user/password/database | env（口令） |
 | llm.model_name / base_url / api_key | 可插拔 | env（api_key） |
 | embedding.host / model | bge-m3 | YAML |
-| rerank.host / model | — | YAML |
+| rerank.enabled / host / path / model | true / http://127.0.0.1:8002 / /rerank | YAML |
+| rerank.api_key / timeout / top_n | 空 / 30s / 0（不截断） | env（api_key） |
 | jwt.secret_key / 过期 | HS256 / 30min / 7d | env（secret） |
 | qdrant.mode / host / port / embedding_size | server / 6333 / 1024 | YAML / env（mode） |
 | qdrant.local_path | — | env（mode=local 时必填） |
-| es.scheme / host / port / index_name | http / 9200 / data-agent-value | YAML |
+| es.scheme / host / port | http / 9200 | YAML |
+| es.value_index / column_index / metric_index | data-agent-value / data-agent-column-text / data-agent-metric-text | YAML |
 | redis.host / port / password | 6379 | env |
 | sql_security.max_execution_time_ms / max_result_rows | 30000 / 10000 | 配置 |
 | cors_origins | 白名单 | env |
@@ -767,6 +844,13 @@ RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决
 > `local`（用 qdrant-client 自带的嵌入式引擎，数据落 `local_path`，不开独立进程）。
 > 两种模式 API 完全一致，业务代码不感知差异。`local` 仅用于**没有 Qdrant 服务的
 > 本地开发**，其限制是 payload 索引不生效（只影响按字段过滤的性能，过滤语义不变）。
+>
+> **rerank**：`enabled=false` 或 `host` 为空时不调用精排，检索直接用 RRF 顺序；
+> `path` 单独配置是因为各家服务的路由不同（TEI/本地服务常见 `/rerank`，
+> 云厂商可能是 `/v1/rerank`）；`api_key` 走环境变量 `RERANK__API_KEY`，只写入
+> `.env`，与 LLM/数据库口令同级对待，不进代码与 YAML。没有部署重排服务时应显式
+> 设 `RERANK__ENABLED=false`——否则每次查询都会因连不上而打一条 WARNING（功能正常，
+> 但日志会脏）。协议适配见 §5.2.1。
 
 ---
 

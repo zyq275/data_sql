@@ -74,11 +74,36 @@ class LLMSettings(BaseModel):
 
 
 class HTTPModelServiceSettings(BaseModel):
-    """Embedding / Rerank 独立模型服务（ADR-005）。"""
+    """Embedding 独立模型服务（ADR-005）。"""
 
     host: str = ""
     model: str = ""
     timeout: int = 30
+
+
+class RerankSettings(BaseModel):
+    """Rerank 独立模型服务（ADR-005 / ADR-007）。
+
+    与 Embedding 分开一个类而不是共用，是因为它多出三项**只对它成立**的配置：
+
+    - ``enabled``：关掉后检索直接跳过精排、用 RRF 融合顺序返回。检索是问答链路
+      上的必经环节，缺一个重排服务不该让整个问答失败，所以降级是设计的一部分
+      而不是异常处理；开关显式化，运维不必靠"配一个连不上的地址"来表达"不要精排"。
+    - ``path``：重排不是 OpenAI 兼容协议的一部分，各家路径不一致。TEI / Xinference /
+      vLLM 是 ``POST /rerank``，SiliconFlow、Jina 等云服务是 ``POST /v1/rerank``。
+      与其在代码里写一串候选路径去猜，不如把它变成一个配置项。
+    - ``api_key``：云厂商的 rerank 需要鉴权。敏感项，只经环境变量/.env 注入
+      （NFR-SEC-003），不写进 YAML、不进日志。
+    """
+
+    enabled: bool = True
+    host: str = ""
+    path: str = "/rerank"
+    model: str = ""
+    api_key: str = ""
+    timeout: int = 30
+    top_n: int = 0
+    """精排后保留多少条；0 表示全部保留（由调用方决定最终截断）。"""
 
 
 class JWTSettings(BaseModel):
@@ -112,12 +137,27 @@ class QdrantSettings(BaseModel):
 
 
 class ElasticsearchSettings(BaseModel):
-    """全文检索（取值召回）。"""
+    """全文检索（阶段 6 起的混合检索第二路）。
+
+    三个索引各管一类，与 Qdrant 的两个集合拼成"每条召回都有两路输入"：
+
+    - ``value_index`` ：取值全文（阶段 4 建，ik 分词），取值召回的**唯一**来源
+    - ``column_index``：字段全文（阶段 6 建），与 Qdrant 的字段向量融合
+    - ``metric_index``：指标全文（阶段 6 建），与 Qdrant 的指标向量融合
+
+    字段/指标也要有全文索引，是因为单路稠密向量分不开近义词——TDD 8.3 记录了
+    实测结论：问"销售额"时 bge-m3 稳定把``sales_quantity``（销量）排在 ``GMV``
+    （成交总额）之前，分差只有 0.02。而指标的 description 里写着"口语常称销售额、
+    营收、卖了多少钱"，BM25 对这种字面共现极其敏感，正好补上向量那一路的短板。
+    两条路的分数不可比（余弦 0~1 vs BM25 无上界），所以融合用的是名次而不是分数。
+    """
 
     scheme: str = "http"
     host: str = "127.0.0.1"
     port: int = 9200
-    index_name: str = "data-agent-value"
+    value_index: str = "data-agent-value"
+    column_index: str = "data-agent-column-text"
+    metric_index: str = "data-agent-metric-text"
     username: str = ""
     password: str = ""
 
@@ -161,7 +201,7 @@ class Settings(BaseSettings):
     db_dw: DatabaseSettings = DatabaseSettings()
     llm: LLMSettings = LLMSettings()
     embedding: HTTPModelServiceSettings = HTTPModelServiceSettings()
-    rerank: HTTPModelServiceSettings = HTTPModelServiceSettings()
+    rerank: RerankSettings = RerankSettings()
     jwt: JWTSettings = JWTSettings()
     qdrant: QdrantSettings = QdrantSettings()
     es: ElasticsearchSettings = ElasticsearchSettings()
