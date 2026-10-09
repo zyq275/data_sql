@@ -36,8 +36,26 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 # 图状态里会出现应用自定义类型（召回候选项、表/指标实体）。langgraph 的 serde
-# 对未登记的类型目前只打一条告警，并明确说未来版本会直接拒绝——与其等升级
-# langgraph 那天会话集体失效，不如现在就把它们登记进来。
+# 对未登记的类型目前只打告警，并明确说未来版本会直接拒绝——与其等升级 langgraph
+# 那天会话集体失效，不如现在就把它们登记进来。
+#
+# **但要说清楚：这份登记在当前配置下是"备好的答案"，并没有生效**。``with_allowlist``
+# 最终落到 ``JsonPlusSerializer.with_msgpack_allowlist``，而它在宽松模式（默认，
+# 即 ``allowed_msgpack_modules=True``）下**直接原样返回、不合并**（langgraph 源码
+# ``checkpoint/serde/jsonplus.py`` 的 ``if base_allowlist is True ... return self``）：
+# 宽松模式的含义本就是"全都放行、只对没登记的告警一次"，此时"哪些登记过"不影响行为。
+# 它真正起作用是在严格模式（``LANGGRAPH_STRICT_MSGPACK=true``，或将来 langgraph 把
+# 默认改成阻塞）——那时这份表就是白名单。但**"被拒"的样子不是抛异常**：serde 的 ext
+# 钩子拒绝一个模块时是 ``return tup[2]``，即**退回原始构造参数**（对 dataclass 就是
+# 一个 dict），只打一条 WARNING。所以漏登记的后果不是"启动即失败"，而是状态里躺着
+# 一个 dict，下游拿它当对象用（``candidate.identity()``）时以 AttributeError 在对话
+# 中途炸掉——报错点离病根隔了一个节点。知道这一点才明白这张表值得单独钉住。
+#
+# 所以：**不改默认模式**（打开严格模式会让任何我们没枚举到的类型都按上述方式降级，
+# 那是另一件事，要单独验证过再定），但这张表本身必须是对的——
+# 它出错的时刻是"升级那天所有会话一起坏"，那正是这个注释想避免的场景。
+# 见 tests/test_redis_checkpointer.py 的两条用例（一条钉登记表本身，一条钉"未登记
+# 会被降级成原始数据"，后者保证前者不是靠"什么都放行"变绿的）。
 STATE_TYPES: tuple[tuple[str, str], ...] = (
     ("app.retrievers.candidate", "Candidate"),
     ("app.agent.knowledge", "ColumnSpec"),

@@ -10,14 +10,20 @@ checkpointer 本身的语义——写进去能读回来、父链接得上、重�
 
 from __future__ import annotations
 
+import logging
 import uuid
+from dataclasses import dataclass
 from typing import TypedDict
 
 import pytest
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
+from app.agent.checkpoint import STATE_TYPES
+from app.agent.knowledge import ColumnSpec, MetricSpec, TableSpec
 from app.agent.redis_checkpointer import RedisCheckpointer
 from app.clients.redis import get_redis
+from app.retrievers.candidate import Candidate
 
 pytestmark = pytest.mark.requires_redis
 
@@ -255,3 +261,111 @@ def test_sync_methods_refuse_loudly() -> None:
 
     with pytest.raises(NotImplementedError):
         checkpointer.get_tuple(config("t"))
+
+
+# ==========================================================================
+# 序列化白名单的登记
+# ==========================================================================
+
+
+@dataclass(slots=True)
+class _Unregistered:
+    """一个**故意不登记**的类型，用来给下面两条用例当尺子。
+
+    写成 dataclass 是因为 serde 的编码侧只认 dataclass / pydantic 这类
+    "有明确结构"的对象（``_msgpack_default``），普通类连**写**都写不进去，
+    那样就测不到"读的时候被拒绝"这件事了。
+    """
+
+    value: int
+
+
+def _strict_saver() -> RedisCheckpointer:
+    """复现严格模式（``LANGGRAPH_STRICT_MSGPACK=true``）下的 serde 形态。
+
+    必须显式传 ``allowed_msgpack_modules=None``：取默认值时它是 ``True``，
+    而 ``with_allowlist`` 在那种情况下**不合并任何东西**（langgraph 源码
+    ``JsonPlusSerializer.with_msgpack_allowlist`` 的 ``if base_allowlist is True:
+    return self``）。用默认值测，测的是"什么都不拦"，那正是要避免的自欺。
+    """
+    return RedisCheckpointer(
+        get_redis(), serde=JsonPlusSerializer(allowed_msgpack_modules=None)
+    ).with_allowlist(STATE_TYPES)
+
+
+def test_registered_state_types_round_trip_through_a_strict_serializer() -> None:
+    """``STATE_TYPES`` 里每个名字都必须能解出自己的类。
+
+    **这条用例不碰 Redis**，它验的是登记表的拼写对不对。宽松模式（默认）下
+    ``with_allowlist`` 是空操作（见 ``agent.checkpoint`` 的说明），今天写错一个
+    类名没有任何症状——症状要等到"将来某次 langgraph 升级把默认改成阻塞"或
+    "我们主动打开严格模式"那天才出现，而且**不报错**（见下一条用例），
+    表现为所有会话的候选/实体在状态里变成一堆 dict。
+    这种失败模式没法靠"多跑几次"发现，只能靠这条用例。
+    """
+    strict = _strict_saver()
+
+    samples = [
+        Candidate(
+            kind="column", id="c-1", name="order_amount", score=0.5, table_name="fact_order"
+        ),
+        ColumnSpec(
+            name="order_amount",
+            type="decimal",
+            alias="订单金额",
+            description=None,
+            is_primary_key=False,
+            is_foreign_key=False,
+            ref_table=None,
+            ref_column=None,
+        ),
+        TableSpec(
+            db_name="data_agent_dw",
+            name="fact_order",
+            alias=None,
+            description=None,
+            is_dimension=False,
+            columns=[],
+        ),
+        MetricSpec(
+            name="GMV",
+            alias="成交总额",
+            description=None,
+            calculation="SUM(order_amount)",
+            filter_condition=None,
+            time_range=None,
+        ),
+    ]
+
+    for sample in samples:
+        codec, payload = strict.serde.dumps_typed(sample)
+        assert strict.serde.loads_typed((codec, payload)) == sample, type(sample).__name__
+
+
+def test_a_strict_serializer_degrades_a_type_we_forgot_to_register(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """反面对照：严格模式下未登记的类型**不会被还原成对象**。
+
+    这是上一条的标尺。若哪天 ``with_allowlist`` 又变回空操作，上一条会因为
+    "什么都放行"而照样变绿，而这一条会红——两条一起，才说明登记表真的在把关。
+
+    **它的失败方式不是抛异常，这点必须写下来**，否则将来有人照着"拒绝"去写
+    ``pytest.raises`` 会得到一个永远不成立的断言。langgraph 的 ext 钩子在拒绝
+    一个模块时是 ``return tup[2]``——**退回原始构造参数**（源码注释："如果用在
+    pydantic state 之类的地方，构造时还会再校验一遍"），只打一条 WARNING。
+    所以漏登记的后果是：状态里躺着一个 dict，下游某个 ``candidate.identity()``
+    以 AttributeError 的形式在对话中途炸掉，报错点离病根隔了整整一个节点。
+    这里断言的正是这个"退化成原始数据且必须留痕"。
+    """
+    strict = _strict_saver()
+
+    # 用宽松的 serde 写（写侧本来就不查白名单），再用严格的 serde 读
+    codec, payload = JsonPlusSerializer().dumps_typed(_Unregistered(1))
+
+    with caplog.at_level(logging.WARNING, logger="langgraph.checkpoint.serde.jsonplus"):
+        restored = strict.serde.loads_typed((codec, payload))
+
+    assert not isinstance(restored, _Unregistered), "未登记的类型不该被还原成对象"
+    assert restored == {"value": 1}, "拒绝的落法是退回构造参数本身，而不是报错"
+    assert "_Unregistered" in caplog.text, "拒绝必须留痕，否则就是静默丢数据"
