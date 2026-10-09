@@ -95,6 +95,65 @@ class NotFoundError(AppException):
     message = "资源不存在"
 
 
+# ---- 402xx 查询（阶段 5：SQL 生成与执行流程） ----
+#
+# TDD 12.1 给出了这一族的业务码，却没给 HTTP 映射——400/401/403/404/500 五族都有映射
+# 规则，唯独 402xx 缺席。这里按同样的原则补齐，并已同步登记进 TDD 12.1：
+# 调用方自己能纠正的 → 4xx；服务端或上游故障 → 5xx。
+#
+# 注意 SSE 场景下的分工（TDD 12.2）：流一旦开始推送，这些异常就不再变成 HTTP 状态码
+# （响应头早已发出、改不了了），而是转成 type=error 事件；HTTP 码只对"开流之前"的失败生效。
+
+
+class QueryError(AppException):
+    """查询请求本身不可用：问题为空、超长、无法解析。"""
+
+    code = 40200
+    http_status = 400
+    message = "查询请求不合法"
+
+
+class SQLGenerationError(AppException):
+    """生成 SQL 失败：模型答复了，但答复的不是能用的 SQL。
+
+    与 LLMServiceError 的分工：本条是"模型答了、但答的不是我们能用的"（空串、
+    纯解释文字、解析不出东西）；LLMServiceError 是"模型根本没答上来"（超时、
+    限流、连接失败、鉴权失败），后者归 500xx。
+    """
+
+    code = 40201
+    http_status = 500
+    message = "SQL 生成失败"
+
+
+class SQLExecutionError(AppException):
+    """数仓执行失败：语法预检通过，但真正跑起来报错（缺表、类型不符等）。"""
+
+    code = 40202
+    http_status = 500
+    message = "SQL 执行失败"
+
+
+class SQLSecurityError(AppException):
+    """SQL 未通过只读安全校验（BR-SQL-001、TDD 13、ADR-008）。
+
+    与 40300 PermissionDeniedError 的区别：那条是"你这个角色不许做这件事"，
+    这条是"这条语句本身就不该被执行"。两者都可能落 HTTP 403，业务码不同。
+    """
+
+    code = 40203
+    http_status = 403
+    message = "SQL 未通过安全校验"
+
+
+class QueryTimeoutError(AppException):
+    """查询超过 max_execution_time_ms（BR-SQL-003）。"""
+
+    code = 40204
+    http_status = 504
+    message = "查询超时"
+
+
 # ---- 500xx 服务 ----
 
 
@@ -106,6 +165,13 @@ class ServiceError(AppException):
     message = "服务内部错误"
 
 
-# 402xx 查询族（40200 QueryError / SQLGeneration / SQLExecution / SQLSecurity / Timeout）
-# 随 SQL 生成与执行流程在阶段 5 引入——TDD 12.1 未给出 402xx 到 HTTP 状态码的映射，
-# 待该阶段与文档一并确定后再补，避免此处臆造映射。
+class LLMServiceError(ServiceError):
+    """LLM 上游不可用：超时、限流、连接失败、鉴权失败（TDD 12.1）。
+
+    单独立一个子类而不是复用 ServiceError，因为它指向的是**外部**故障：
+    排查要先看模型服务的配额与网络，而不是看本服务。业务码区分开，
+    日志与告警才能按类归因。
+    """
+
+    code = 50001
+    message = "LLM 服务不可用"

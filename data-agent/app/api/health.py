@@ -23,10 +23,9 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, Response
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.clients import embedding, es, qdrant
-from app.clients.mysql import get_engine
+from app.clients.mysql import get_dw_engine, get_engine
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -55,16 +54,13 @@ async def _check_mysql_meta() -> str:
 async def _check_mysql_dw() -> str:
     """dw 库单独探测：它是独立库 + 只读账号，meta 通不代表 dw 通。
 
-    用一次性引擎而不是常驻连接池——阶段 4 还没有任何请求会查 dw（执行环节在
-    阶段 5 才落地），为探针常开一个池不划算；探针频率低，建连开销可以接受。
+    用常驻连接池。阶段 4 时这里是一次性引擎（当时没有任何请求会查 dw，为探针常开
+    一个池不划算）；阶段 5 起每次问答的执行环节都走这个池，探针再用一次性引擎就会
+    探错对象——建连成功但池已耗尽时，探针报 ok 而真实查询在排队等待。
+    复用同一个池，探到的才是请求实际会用的那条路。
     """
-    settings = get_settings()
-    engine = create_async_engine(settings.db_dw.url, pool_pre_ping=True)
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-    finally:
-        await engine.dispose()
+    async with get_dw_engine().connect() as conn:
+        await conn.execute(text("SELECT 1"))
     return "SELECT 1 正常"
 
 

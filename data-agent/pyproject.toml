@@ -27,11 +27,20 @@ dependencies = [
     "httpx>=0.27",
     "qdrant-client>=1.12",
     "elasticsearch[async]>=8.15,<9",
+    # Agent 闭环（阶段 5）
+    # langgraph 提供 StateGraph 与 Runtime（runtime.stream_writer 推 SSE 进度）；
+    # langchain-openai 的 ChatOpenAI 直接对接 OpenAI 兼容端点（DeepSeek / Ollama 等），
+    # 自带超时、重试与流式，不必手写 HTTP 客户端。只装 langchain-openai：
+    # 它依赖 langchain-core，而重量级的 langchain 包（chains/agents 等）这里用不到。
+    "langgraph>=1.0",
+    "langchain-openai>=1.0",
+    # SQL 只读校验用解析而非正则：正则挡不住 `WITH x AS (...) DELETE` 这类
+    # SELECT 开头、实则写入的语句（MySQL 8 支持），必须按 token 类型判定（TDD 13）
+    "sqlparse>=0.5",
 ]
 
 # 以下依赖按开发阶段逐步启用（见《开发步骤文档》），避免过早引入未使用的重依赖：
-#   阶段 5  Agent 闭环  : langgraph>=1.0, langchain>=1.2, langchain-openai
-#   阶段 6  混合检索    : redis[hiredis]
+#   阶段 6  混合检索    : redis[hiredis]、jieba（关键字分词）
 #   阶段 11 可观测      : loguru, opentelemetry-sdk, opentelemetry-instrumentation-fastapi, langfuse
 
 [project.optional-dependencies]
@@ -59,4 +68,6 @@ asyncio_default_test_loop_scope = "session"
 markers = [
     # 需要 MySQL/Qdrant/Elasticsearch/Embedding 全部在跑；没起时自动跳过（见 tests/conftest.py）
     "requires_stack: 需要完整外部服务栈（阶段 4 知识库验收）",
+    # 需要 .env 里配好真实的 LLM__API_KEY；没配时自动跳过（见 tests/conftest.py）
+    "requires_llm: 需要真实大模型服务（阶段 5 端到端验收）",
 ]

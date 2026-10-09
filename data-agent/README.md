@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 4 知识库构建**。
+当前进度：**阶段 5 单轮 Agent 闭环**。
 
 ## 环境要求
 
@@ -13,6 +13,7 @@ Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说�
   - **Qdrant** —— 或用 `qdrant.mode=local` 走嵌入式模式（见下）
   - **Elasticsearch 8.x + analysis-ik 插件** —— 版本必须完全一致
   - **Embedding HTTP 服务** —— 本项目用 Ollama 提供 bge-m3（ADR-005：不在应用内做本地推理）
+- 阶段 5 起还需要：**大模型服务**（OpenAI 兼容端点，默认 DeepSeek 云，需自备 API Key）
 - Node ≥ 20（前端独立目录 `../data-agent-frontend`）
 
 ## 首次准备
@@ -26,7 +27,18 @@ cp .env.example .env      # 填入 DB_META__PASSWORD 等真实值，.env 不入�
 ```
 
 未配置 `JWT__SECRET_KEY` 时应用会**拒绝启动**（启动自检，NFR-SEC-003），
-而不是等到第一次登录才 500。
+而不是等到第一次登录才 500。阶段 5 起 `LLM__API_KEY` 同样纳入启动自检：
+没有它整个问答链路一次都跑不通，失败会以"每个请求都报 50001"的形式出现——
+现象在业务接口、原因在配置，排查要绕一大圈，不如启动即拒。
+
+大模型走 OpenAI 兼容端点，换供应商只改 `.env`（`LLM__MODEL_NAME` / `LLM__BASE_URL` /
+`LLM__API_KEY`），代码不动。本项目默认 DeepSeek：
+
+```
+LLM__MODEL_NAME=deepseek-chat
+LLM__BASE_URL=https://api.deepseek.com/v1
+LLM__API_KEY=<自备>
+```
 
 初始化第一个管理员（管理员无法通过接口创建自己）：
 
@@ -78,12 +90,22 @@ uv pip install -e ".[dev]"            # 测试依赖
 .venv/Scripts/python.exe -m pytest    # 全量
 ```
 
-分两类：配置解析、探针骨架、口令脱敏这类**纯逻辑测试不需要任何外部服务**，
-随时可跑；涉及真实存储与知识库的用例标了 `requires_stack`，外部服务没起时
-**跳过并说明缺什么**，而不是失败——失败会掩盖真正的问题。
+分三类：
+
+- **纯逻辑测试**（配置解析、探针骨架、口令脱敏、SQL 只读校验、图的拓扑与校正回边）
+  不需要任何外部服务，随时可跑；
+- 涉及真实存储与知识库的用例标 `requires_stack`，外部服务没起时**跳过并说明缺什么**，
+  而不是失败——失败会掩盖真正的问题；
+- 需要真调大模型的用例标 `requires_llm`，`.env` 里没配真实的 `LLM__API_KEY` 时跳过。
 
 跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
 那是真问题，测试必须失败，不会被跳过掩盖。
+
+跑阶段 5 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
+
+```bash
+.venv/Scripts/python.exe -m pytest tests/test_stage5_acceptance.py -v -s
+```
 
 ## 验证清单（阶段 1 验收）
 
@@ -94,7 +116,7 @@ uv pip install -e ".[dev]"            # 测试依赖
 | CORS 通配符被拦截 | 生产模式（`APP__DEBUG=false`）下设 `CORS_ORIGINS=["*"]`，启动即报错 |
 | Alembic 能执行一次空迁移 | `alembic upgrade head`（需先建库并配置口令） |
 
-## 接口清单（阶段 3）
+## 接口清单（阶段 3 + 阶段 5）
 
 | 方法 | 路径 | 鉴权 |
 |---|---|---|
@@ -102,15 +124,18 @@ uv pip install -e ".[dev]"            # 测试依赖
 | POST | `/api/v1/auth/refresh` | 无（refresh_token 走请求体） |
 | GET | `/api/v1/auth/me` | Bearer |
 | PUT | `/api/v1/auth/password` | Bearer |
+| POST | `/api/v1/query` | Bearer（SSE 流式返回） |
 | GET | `/api/v1/admin/users` | admin（支持 `page`/`page_size`/`keyword`） |
 | POST | `/api/v1/admin/users` | admin |
 | PUT | `/api/v1/admin/users/{id}/role` | admin |
 | PUT | `/api/v1/admin/users/{id}/status` | admin |
 
 响应统一为 `{"code": 0, "message": "ok", "data": ...}`；出错时 `code` 为业务码
-（40000 参数/业务规则、40100 认证、40101 令牌过期、40102 令牌无效、40300 权限、
-40400 资源、50000 服务），HTTP 状态码按类别同步返回。`/health` 与 `/health/ready`
-是探针，按约定返回裸结构、不套信封。
+（40000 参数/业务规则、40100 认证、40101 令牌过期、40102 令牌无效、40200 查询请求不合法、
+40201 SQL 生成失败、40202 SQL 执行失败、40203 SQL 未通过安全校验、40204 查询超时、
+40300 权限、40400 资源、50000 服务、50001 LLM 上游不可用），HTTP 状态码按类别同步返回。
+`/health` 与 `/health/ready` 是探针，按约定返回裸结构、不套信封；`/api/v1/query` 是 SSE，
+响应体是事件序列、同样不套信封。
 
 ## 验证清单（阶段 4 验收）
 
@@ -212,6 +237,88 @@ id，因此重建后 id 不变（`permission.resource_id` 不会失效），也�
 
 结束后会做入库自检——核对"配置声明"与"实际入库"的行数，不一致直接失败。
 
+## 单轮问答链路（阶段 5）
+
+`POST /api/v1/query` 把一句自然语言问题跑成一条 SSE 事件流。图按 TDD 5.1 编排：
+
+```
+extract_keywords ─┬─ recall_column ─┐
+                  ├─ recall_value  ─┼─ merge_retrieved_info ─┬─ filter_table  ─┐
+                  └─ recall_metric ─┘                        └─ filter_metric ─┴─ add_extra_context
+                                                                                      ↓
+                                        ┌──────────────────────────► generate_sql ─► validate_sql
+                                        │                                              │
+                                  correct_sql ◄── 未通过且 < 3 次 ──────────────────────┤
+                                        │                                              │
+                                        └──────────────────────────────────────────────┤
+                                        execute_sql ◄────────── 通过 ───────────────────┤
+                                                                                       │
+                                        END ◄────────── 未通过且 ≥ 3 次 ────────────────┘
+```
+
+两处并行都用"扇出 + 汇合"表达：汇合节点等齐所有上游才开跑。这不是写法偏好——
+先到的分支会让汇合节点看到半份候选集，最终 SQL 少一个 JOIN，且不报任何错。
+
+试一下（先登录拿令牌）：
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<口令>"}' | python -c "import sys,json;print(json.load(sys.stdin)['data']['access_token'])")
+
+curl -N -X POST http://127.0.0.1:8000/api/v1/query \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"query":"去年华东区销售额前三的省份"}'
+```
+
+### SSE 事件（TDD 7.3）
+
+帧格式 `event: <type>` + `data: <json>` + 空行。
+
+| type | 字段 |
+|---|---|
+| progress | step（节点名）、status（start / done） |
+| sql | sql |
+| result | data.columns、data.rows、data.row_count、data.truncated |
+| error | code、message |
+| done | correction_count、row_count |
+
+`progress` 由各节点推；`sql` / `result` 由 `execute_sql` 推；`error` **只在终态推一次**
+（校正循环中间的失败不推，否则前端会弹出一串马上被修好的报错）；终态无错则推 `done`。
+开流之后响应头已发出、状态码改不了，所有失败一律走 `error` 事件；开流之前的失败
+（鉴权、入参）仍按统一信封返回。
+
+### SQL 安全
+
+只读校验在 `app/core/sql_security.py`，按 token 类型判定而非正则：首关键字白名单
+（SELECT / WITH / EXPLAIN / SHOW / DESC）+ 危险关键字黑名单 + 多语句拦截 + `/*!` 可执行
+注释拦截。字符串字面量与注释里的关键字不算命中。`validate_sql` 校验通过后再用只读
+账号做 EXPLAIN 预检；`execute_sql` 执行前再校验一次——安全闸门要装在自己身上，
+不能指望上一个节点一定先跑过。
+
+第二道防线是数据库账号本身：dw 只读账号只有 SELECT 权限（ADR-008 / NFR-SEC-007），
+校验被绕过也写不进去。执行侧还有三重限制：会话级 `MAX_EXECUTION_TIME`、
+`max_result_rows` 流式截断（截断会如实写进 `result.truncated`）、墙钟超时兜底。
+
+### 提示词
+
+独立放 `prompts/*.prompt`，占位符写成 `{name}`。渲染不经 `str.format`：模板里有 JSON
+结构示例，format 会把示例的花括号当占位符报错。`date_info` 里的相对时间换算
+（去年 / 上季度 / 近 7 天…）由代码算好给模型照抄——日期算术交给模型既容易错又没法测。
+
+## 验证清单（阶段 5 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 输入"去年华东区销售额前三的省份"返回正确结果 | `pytest tests/test_stage5_acceptance.py -v -s` 里会打印生成 SQL 与结果行 |
+| SSE 流式推送进度、结果与 SQL | 同上，断言 `progress` / `sql` / `result` / `done` 都在且 sql 先于 result；也可用上面的 `curl -N` 肉眼观察逐帧推送 |
+| SQL 只读校验生效、写操作被拒 | 用桩把模型输出换成 DROP/DELETE/UPDATE/多语句，断言 40203 且没有任何结果集；另测只读账号本身建表被 MySQL 拒绝 |
+| 连续校正 3 次仍不通过时终止并返回明确错误 | 喂一条"只读但列不存在"的 SQL，断言 `correct_sql` 恰好执行 3 次、终态 error 事件带根因且只报一次 |
+
+四条标准已落成自动化用例（`tests/test_stage5_acceptance.py`）。第 3、4 条特意用桩喂
+恶意/错误 SQL，而不是指望真实模型主动生成写语句——指望它触发安全闸门，
+等于这道闸门没被测过。第 1、2 条必须真调大模型，否则验的是桩不是链路。
+
 ## 目录结构
 
 ```
@@ -222,19 +329,20 @@ data-agent/
 ├── conf/
 │   ├── app_config.yaml        基础配置（非敏感默认值）
 │   └── meta_config.yaml       元数据知识库定义（阶段 4）
-├── prompts/                   提示词文件（阶段 5 起）
+├── prompts/                   提示词文件（7 个，与 TDD 6 的表格对应）
 ├── app/
 │   ├── api/                   接口层：middleware / health / v1 路由
-│   ├── agent/                 智能体层：graph、state、nodes（阶段 5）
-│   ├── retrievers/            混合检索与 rerank（阶段 6）
+│   ├── agent/                 智能体层：graph、state、context、events、llm、
+│   │                          prompts、parsing、knowledge、rendering、nodes/
+│   ├── retrievers/            retrieval.py 是阶段 6 混合检索的唯一替换点
 │   ├── clients/               外部连接生命周期管理
-│   ├── repositories/          数据访问层
+│   ├── repositories/          数据访问层（meta 注入式会话；dw 自开只读连接）
 │   ├── entities/              领域实体
 │   ├── models/                ORM 模型（阶段 2）
 │   ├── schemas/               请求/响应模型
 │   ├── services/              业务编排
-│   ├── core/                  配置/安全/异常/日志/响应
-│   └── scripts/               离线脚本（init_admin；阶段 4 起加知识库构建）
+│   ├── core/                  配置/安全/异常/日志/响应（含 sql_security.py）
+│   └── scripts/               离线脚本（init_admin、build_meta、seed_dw）
 ├── evals/                     评测集与评测脚本（阶段 10）
 └── tests/                     单元测试
 ```

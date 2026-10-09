@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from app.api.health import router as health_router
 from app.api.middleware import register_cors
 from app.api.v1.router import router as v1_router
+from app.agent.llm import dispose_llm
 from app.clients.embedding import dispose_client as dispose_embedding
 from app.clients.es import dispose_es
 from app.clients.mysql import dispose_engine
@@ -27,6 +28,16 @@ def check_security_settings(settings: Settings) -> None:
         raise RuntimeError(
             "jwt.secret_key 未配置，请在 .env 中设置 JWT__SECRET_KEY（NFR-SEC-003）"
         )
+    if not settings.llm.api_key:
+        # 和 JWT 密钥同样处理：没有它，整个问答链路一次都跑不通，而失败会以
+        # 「每个请求都报 50001」的形式出现——现象在业务接口，原因在配置，
+        # 排查要绕一大圈。启动即拒、并把要设的键名写在提示里，代价是一次重启。
+        #
+        # 反方观点是"管理接口不依赖 LLM，不该被拖住"；但一个问数服务起得来、
+        # 问不了数，对使用者的误导更大，不一致的可用状态更难被察觉。
+        raise RuntimeError(
+            "llm.api_key 未配置，请在 .env 中设置 LLM__API_KEY（阶段 5 起问答接口必需）"
+        )
 
 
 @asynccontextmanager
@@ -39,10 +50,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     print(f"[startup] {settings.app.name} v{settings.app.version} (debug={settings.app.debug})")
     yield
-    await dispose_engine()
+    await dispose_engine()  # 含 meta 与 dw 两个引擎
     await dispose_qdrant()
     await dispose_es()
     await dispose_embedding()
+    # LLM 客户端持有 httpx 连接池，不关会在测试与热重载里累积成"连接未关闭"告警
+    await dispose_llm()
     print("[shutdown] bye")
 
 

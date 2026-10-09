@@ -21,12 +21,25 @@ from urllib.parse import urlparse
 
 import pytest
 
+from app.core.config import Settings
+
 # main.py 在导入时就执行 create_app()，而 create_app 会做启动自检：
 # 缺 JWT__SECRET_KEY 直接抛 RuntimeError（NFR-SEC-003）。测试进程不一定有 .env，
 # 这里在导入应用之前先兜一个测试专用密钥。
 # 用 setdefault 之外的行为是刻意的：环境变量优先级高于 .env，所以测试始终用这个
 # 密钥而不是开发者机器上的真实密钥，结果不随个人环境漂移。
 os.environ.setdefault("JWT__SECRET_KEY", "test-only-secret-do-not-use-in-production")
+
+# 启动自检从阶段 5 起也要求 LLM__API_KEY。这里**不能**照抄上面的 setdefault：
+# 环境变量优先于 .env，无脑设一个占位值会把开发者 .env 里的真实 Key 顶掉，
+# 于是阶段 5 的端到端验收会拿着假 Key 去调 DeepSeek，全部报鉴权失败。
+# 所以先看 .env 里到底有没有（此刻环境变量还没被污染，读到的就是 .env 的真值），
+# 有就一个字节都不动；没有才补占位值，让"不依赖真实 LLM"的那些用例仍能导入应用。
+LLM_KEY_PLACEHOLDER = "test-only-key-do-not-use"
+_REAL_LLM_KEY = Settings().llm.api_key
+HAS_REAL_LLM = bool(_REAL_LLM_KEY and _REAL_LLM_KEY != LLM_KEY_PLACEHOLDER)
+if not HAS_REAL_LLM:
+    os.environ["LLM__API_KEY"] = LLM_KEY_PLACEHOLDER
 
 TCP_PROBE_TIMEOUT_SECONDS = 1.0
 
@@ -80,3 +93,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "requires_stack" in item.keywords:
             item.add_marker(skip_marker)
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """没配真实 LLM Key 时跳过需要真模型调用的用例。
+
+    与 ``requires_stack`` 分开判定、也分开打标：知识库通了不等于模型能调，
+    两个条件各自可能单独不满足，合成一个标记会让"为什么跳过"说不清到底缺哪一项。
+    """
+    if "requires_llm" in item.keywords and not HAS_REAL_LLM:
+        pytest.skip("未配置真实的 LLM__API_KEY（.env），跳过需要调用大模型的用例")

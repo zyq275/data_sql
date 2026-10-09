@@ -66,7 +66,8 @@
 | 语言 | Python | ≥3.12 | 新式泛型语法 |
 | Web 框架 | FastAPI | ≥0.128 | 原生异步、自动 OpenAPI、SSE 友好 |
 | Agent 编排 | LangGraph | ≥1.0 | 图式编排、checkpointer、stream 模式 |
-| LLM 接入 | LangChain | ≥1.2 | 统一 Prompt/OutputParser 抽象 |
+| LLM 接入 | langchain-openai | ≥1.0 | ChatOpenAI 直连 OpenAI 兼容端点（DeepSeek/Ollama），自带超时、重试与流式；只装 langchain-core 这一支，重量级的 langchain（chains/agents）本方案用不到 |
+| SQL 解析 | sqlparse | ≥0.5 | 按 token 类型判只读；正则挡不住 `WITH x AS (...) DELETE` 这类以 SELECT 类关键字开头、实则写入的语句（见 §13） |
 | 模型 | DeepSeek/Qwen/GLM（可插拔） | OpenAI 兼容 | 中文友好、成本可控 |
 | 嵌入模型 | bge-m3（独立服务） | — | 多语言、语义强 |
 | ORM | SQLAlchemy 2.0（async）+ Alembic | ≥2.0 | 异步 + 数据库迁移 |
@@ -102,16 +103,21 @@ data-agent/                        # 后端
 │   ├── agent/                     # 智能体层
 │   │   ├── graph.py               # 图编排（带 checkpointer）
 │   │   ├── state.py / context.py
+│   │   ├── events.py              # SSE 事件构造与节点进度上报
 │   │   ├── llm.py                 # LLM 实例
+│   │   ├── prompts.py             # 提示词装载与占位符渲染
+│   │   ├── parsing.py             # 模型 JSON 输出的容错解析
+│   │   ├── knowledge.py           # 表/字段/指标口径获取
+│   │   ├── rendering.py           # 上下文拼装（表结构/指标/日期/库环境）
 │   │   └── nodes/*.py             # 各节点
-│   ├── retrievers/                # 检索层（混合检索/rerank）
+│   ├── retrievers/                # 检索层（retrieval.py 为阶段 6 混合检索的替换点）
 │   ├── clients/                   # 连接管理器
-│   ├── repositories/              # 数据访问层
+│   ├── repositories/              # 数据访问层（meta 注入式会话；dw 自开只读连接）
 │   ├── entities/                  # 领域实体
 │   ├── models/                    # ORM 模型
 │   ├── schemas/                   # 请求/响应
 │   ├── services/                  # 服务层
-│   ├── core/                      # 配置/安全/异常/日志/响应
+│   ├── core/                      # 配置/安全/异常/日志/响应（含 sql_security.py）
 │   └── scripts/                   # 离线脚本
 ├── evals/                         # 评测集与评测脚本
 └── tests/                         # 单元测试
@@ -130,8 +136,11 @@ data-agent-frontend/               # 前端
 | core.config | pydantic-settings 分层配置 |
 | core.security | JWT、bcrypt、角色依赖 |
 | core.response / exceptions | 统一响应与错误码 |
-| agent.graph | 节点与边定义，编译带 checkpointer 的图 |
+| agent.graph | 节点与边定义，编译带 checkpointer 的图（阶段 5 起） |
 | agent.nodes.* | 单一职责节点 |
+| agent.events / rendering / parsing / prompts | 事件构造、上下文拼装、模型输出解析、提示词装载 |
+| core.sql_security | SQL 只读校验（白名单解析 + 关键词黑名单） |
+| repositories.dw | 数仓只读执行与三重限制 |
 | retrievers.* | 混合检索、RRF 融合、rerank |
 | clients.* | 外部连接生命周期 |
 | repositories.* | 存储访问封装 |
@@ -213,6 +222,14 @@ recall_column        recall_value                  recall_metric
 | history | list | 会话历史（上文问题/SQL/过滤条件/授权范围），由 checkpointer 注入 |
 | correction_count | int | SQL 校正次数，初值 0，上限 3（BR-SQL-005） |
 | error | str \| None | validate_sql 写回，驱动条件边分流 |
+| error_code | int \| None | 与 error 配套的业务码（12.1），供 SSE 的 error 事件使用 |
+
+> **阶段 5 的实现范围**：图上只做 `resolve_reference` 之后、`generate_explain` 之前的
+> 那一段（十二个节点），不存在 checkpointer 与 resolve_reference（阶段 7 引入），
+> 也没有 generate_explain / recommend_visualization（阶段 8 引入）。入口把
+> `resolved_query` 直接填成 `query`，而**所有下游节点一律只读 `resolved_query`**：
+> 阶段 7 只需把"原样透传"换成"指代消解"，十二个节点一行都不用改；反过来若阶段 5
+> 图省事让下游读 `query`，阶段 7 就得挨个改且极易漏掉某一处。
 
 ### 5.2 混合检索流程
 
@@ -310,6 +327,17 @@ recall_column        recall_value                  recall_metric
 - 防注入：明确"仅使用提供的表/字段"，降低幻觉与越权。
 - 指标口径锁定：要求"严格遵循指标定义，不得偏离"。
 
+**占位符约定**（阶段 5 起）：模板里的变量写成 `{name}`（小写标识符）。渲染器按这一
+形态逐个替换，因此 JSON 结构示例里的花括号（`{"tables": [...]}`）原样保留——
+这也是渲染不走 `str.format` 的原因：format 会把示例里的花括号当成未转义占位符直接报错，
+而要求作者写成 `{{` `}}` 又极易被改坏。
+
+**相对时间由代码算，不交给模型**：`date_info` 是一张由代码生成的换算表
+（今天 / 昨天 / 近 7 天 / 本月 / 上月 / 本季度 / 上季度 / 今年 / 去年…），
+模型只需挑一行照抄。日期算术（跨月、闰年、季度边界）交给模型既容易错又没法测，
+放进上下文等于把不确定性从"推理"挪到"查表"。数据表的时间字段形状不写死：
+既可能是 `yyyymmdd` 的整数主键，也可能是独立的年 / 季 / 月整数列，用哪一列由表结构决定。
+
 ---
 
 ## 7. 接口设计
@@ -358,12 +386,25 @@ recall_column        recall_value                  recall_metric
 
 | type | 含义 | 字段 |
 |---|---|---|
-| progress | 节点进度 | step、status |
-| result | 查询结果 | data（行数组） |
+| progress | 节点进度 | step（节点名）、status（start / done） |
 | sql | 生成的 SQL | sql |
+| result | 查询结果 | data.columns、data.rows、data.row_count、data.truncated |
 | explain | 自然语言解释 | text |
 | viz | 图表类型推荐 | chart_type |
-| error | 出错 | message |
+| error | 出错 | code（业务码，见 12.1）、message |
+| done | 本次问答正常结束 | correction_count、row_count |
+
+传输采用标准 SSE 帧：`event: <type>` 行 + `data: <json>` 行 + 空行。`data` 里同时保留
+`type` 字段，使单帧脱离上下文也可读。
+
+事件发出者分工（阶段 5 起）：
+
+- `progress` 由节点自己推（进入推 start、正常返回推 done，step 用节点名）；
+- `sql` / `result` 由 execute_sql 推（sql 先于 result，前端可先展示语句再等结果集）；
+- `error` **只由服务层在终态推一次**——校正循环中间会有多次校验失败，逐个推事件会让
+  前端弹出一串马上被修好的错误。终态无错则推 `done`。
+- 开流之后不再回改 HTTP 状态码（响应头已发出），所有失败一律走 `error` 事件；
+  开流之前（鉴权、入参校验）仍按 7.1 的统一信封返回。
 
 ---
 
@@ -743,6 +784,19 @@ RRF 融合 + rerank 交叉编码来纠正，不能靠继续调索引文本解决
 | 500xx | 服务 | 50000 ServiceError、LLMServiceError |
 
 > 说明：HTTP 状态码与业务码同步返回——`code` 字段承载业务码（如 40100/40300/40000），HTTP 状态码按类别映射（400→400xx、401→401xx、403→403xx、404→404xx、500→500xx）。PRD 验收标准中的「返回 401/403/400」均指 HTTP 状态码。
+
+402xx 一族的 HTTP 映射按同一原则补齐（调用方自己能纠正的 → 4xx，服务端或上游故障 → 5xx）：
+
+| 业务码 | 异常 | HTTP | 触发场景 |
+|---|---|---|---|
+| 40200 | QueryError | 400 | 问题本身不可用：为空、超长、召回不到任何数据表 |
+| 40201 | SQLGenerationError | 500 | 模型答复了但不是能用的 SQL；也用于 EXPLAIN 预检未通过 |
+| 40202 | SQLExecutionError | 500 | 预检通过但真正执行时报错（缺表、类型不符） |
+| 40203 | SQLSecurityError | 403 | 未通过只读安全校验（BR-SQL-001） |
+| 40204 | QueryTimeoutError | 504 | 超过 max_execution_time_ms（BR-SQL-003） |
+
+> 40201 与 50001 的分工：前者是「模型答了，但答的不是我们能用的」（空串、纯解释文字），
+> 后者是「模型根本没答上来」（超时、限流、鉴权失败），归 500xx。
 
 ### 12.2 处理策略
 
