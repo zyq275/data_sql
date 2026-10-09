@@ -1,9 +1,14 @@
 """SSE 事件构造与节点进度上报（TDD 7.3）。
 
-**谁推什么**：节点只推 ``progress``（进度）；``sql`` / ``result`` 由真正产出它们的
-``execute_sql`` 推；``error`` **统一由服务层推**，节点不推。这样"一次失败只报一次错"
-是结构性保证的——若节点也推 error，异常路径上就会出现"节点推一次、服务层再推一次"
-的重复事件，而前端多半会把它渲染成两条错误提示。
+**谁推什么**：节点只推 ``progress``（进度）；``sql`` / ``result`` / ``explain`` /
+``viz`` 由真正产出它们的那一个节点推（分别是 ``execute_sql`` / ``generate_explain``
+/ ``recommend_visualization``）；``error`` **统一由服务层推**，节点不推。这样
+"一次失败只报一次错"是结构性保证的——若节点也推 error，异常路径上就会出现
+"节点推一次、服务层再推一次"的重复事件，而前端多半会把它渲染成两条错误提示。
+
+**产出型事件一律"谁算出来谁推"**，不在服务层统一转发：服务层要转发就得把每个
+事件的数据先存一遍，于是同一份数据在图上有一份、服务层再抄一份，两处一旦不一致，
+症状是"页面上显示的 SQL 和结果对不上"。节点手里正握着那份数据，推出去即可。
 """
 
 from __future__ import annotations
@@ -20,6 +25,8 @@ logger = logging.getLogger(__name__)
 PROGRESS = "progress"
 SQL = "sql"
 RESULT = "result"
+EXPLAIN = "explain"
+VIZ = "viz"
 ERROR = "error"
 DONE = "done"
 

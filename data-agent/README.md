@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 7 多轮会话与查询历史**。
+当前进度：**阶段 8 可解释性与可视化推荐**。
 
 ## 环境要求
 
@@ -110,11 +110,12 @@ uv pip install -e ".[dev]"            # 测试依赖
 跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
 那是真问题，测试必须失败，不会被跳过掩盖。
 
-跑阶段 5 / 阶段 7 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
+跑阶段 5 / 阶段 7 / 阶段 8 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/test_stage5_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage7_acceptance.py -v -s
+.venv/Scripts/python.exe -m pytest tests/test_stage8_acceptance.py -v -s
 ```
 
 ## 验证清单（阶段 1 验收）
@@ -332,7 +333,14 @@ extract_keywords ─┬─ recall_column ─┐
                                         │                                              │
                                         └──────────────────────────────────────────────┤
                                         execute_sql ◄────────── 通过 ───────────────────┤
-                                                                                       │
+                                               │                                       │
+                                               ▼                                       │
+                                       generate_explain                                │
+                                               │                                       │
+                                               ▼                                       │
+                                    recommend_visualization                            │
+                                               │                                       │
+                                               ▼                                       │
                                         END ◄────────── 未通过且 ≥ 3 次 ────────────────┘
 ```
 
@@ -360,13 +368,20 @@ curl -N -X POST http://127.0.0.1:8000/api/v1/query \
 | progress | step（节点名）、status（start / done） |
 | sql | sql |
 | result | data.columns、data.rows、data.row_count、data.truncated |
+| explain | text（自然语言解释） |
+| viz | chart_type（`bar` / `line` / `pie` / `table` / null）、message |
 | error | code、message |
 | done | correction_count、row_count |
 
-`progress` 由各节点推；`sql` / `result` 由 `execute_sql` 推；`error` **只在终态推一次**
+`progress` 由各节点推；`sql` / `result` / `explain` / `viz` 各由产出它们的那个节点推
+（`execute_sql` / `generate_explain` / `recommend_visualization`）；`error` **只在终态推一次**
 （校正循环中间的失败不推，否则前端会弹出一串马上被修好的报错）；终态无错则推 `done`。
 开流之后响应头已发出、状态码改不了，所有失败一律走 `error` 事件；开流之前的失败
 （鉴权、入参）仍按统一信封返回。
+
+成功一轮的实际次序：`sql → result → explain → viz → done`（中间夹着各节点的 `progress`）。
+`explain` 允许缺席——它是 P1 且允许降级，模型抖动时整轮照常结束，只是没有解释；
+前端据此不渲染解释区即可，不必把"没有解释"当成错误。
 
 ### SQL 安全
 
@@ -518,6 +533,67 @@ k=60 时第 1 名与第 2 名只差 ≈0.0003，而另一路投的一票 ≥1/61
 `tests/test_conversation_api.py` 与 `tests/test_history_api.py` 出于同样的理由
 也带运行随机后缀。
 
+## 可解释性与可视化推荐（阶段 8）
+
+| 文件 | 职责 |
+|---|---|
+| `agent/nodes/generate_explain.py` | 生成自然语言解释，推 `explain` 事件 |
+| `agent/nodes/recommend_visualization.py` | 取结果、调规则、推 `viz` 事件（本文件很薄，见下） |
+| `agent/visualization.py` | 图表推荐规则本身（纯函数） |
+| `agent/rendering.py` 的 `result_summary_text` | 把结果集渲染成给解释节点看的摘要 |
+| `prompts/generate_explain.prompt` | 解释提示词，输出纯文本 |
+
+**图表推荐是规则，不是提示词**。TDD 6 的提示词表里列过一份 `recommend_visualization`，
+实现时没有采用，理由三条：FR-VIZ-001 的验收标准本身就是一张规则表，而"符合规则"
+只有把规则写进代码才验得了——交给模型的话，同一份结果今天推柱状、明天推折线；
+"按结果结构推荐"本来就是结构化判断，不需要理解语义；它因此也是图上**唯一一个
+不会失败的节点**（纯计算，没有上游可抖，所以 `recommend_visualization.py` 里
+没有一行 try/except）。这是一处对 TDD 的有意偏离，已在 TDD §6 记明。
+
+判定表（`agent/visualization.py`）：
+
+| 条件 | 推荐 |
+|---|---|
+| 结果为空 | 不推荐（`chart_type=null`），提示"无数据" |
+| 单维分组，且度量里有占比型的 | 饼图 |
+| 单维分组 + 单度量，该维是时间 | 折线图 |
+| 单维分组 + 单度量，该维是普通维度 | 柱状图 |
+| 单度量，维度**全部**是时间（`year` + `quarter` 两列） | 折线图 |
+| 其余（多列明细） | 表格 |
+
+三处判定口径值得单独说，因为它们都是踩过才写下来的：
+
+- **时间列靠列名认，不能靠值**。数仓的时间维度是 `dim_date` 的 `year` / `quarter` /
+  `month` / `day` 四个**整数**列，光看值它们和度量一模一样。只按"值是不是数字"分类，
+  "各季度销售额"会被认成两个度量而退回表格——不报错，只是永远画不出折线。
+- **标识列（`id` / `*_id`）永远不是度量**，哪怕它是整数。否则明细查询会被算成
+  "三维度两度量"，结论碰巧也是表格，但理由全错。
+- **占比可以带一个原始金额列**。实测问"各地区的销售额占比"，模型返回
+  `大区 / 销售额 / 销售额占比` 三列——原始金额不是干扰，占比正是由它算出来的。
+  要求"恰好一个度量"会把这种最典型的占比查询判成表格。
+
+**解释失败不判死整轮问答**：它是 P1，而 `execute_sql` 早把结果推出去了，
+所以失败只告警、`explain_text` 写 NULL、`done` 照常推。注意它**没有**照抄
+`resolve_reference` 的长度上限——后者的输出会灌进此后每一次 LLM 调用，
+失控一行就拖慢整条链路；解释的输出是终点，只推给前端、只写进一个 TEXT 列。
+
+**落库**：`explain_text` 写进 `message` 与 `query_history`（阶段 2 就建好了这两列，
+阶段 7 如实写 NULL 并注明"由阶段 8 产出"，到此关闭）。`chart_type` **不落库**——
+表结构里没有对应列，而它完全由结果结构决定，需要时用同一份 `result_preview`
+重算即可，存一份反而会旧。
+
+## 验证清单（阶段 8 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 结果页展示 SQL 与解释 | `pytest tests/test_stage8_acceptance.py -v`：一次真问答里 `sql` 与 `explain` 两条事件都在且解释非空，且 `result` 排在他们前面 |
+| 解释与 SQL 实际逻辑一致 | 同上：问一个带显著过滤条件的问题，先自证 SQL 里确实筛了华东，再断言解释提到了华东、且**没有**提到别的大区（编造条件比漏说条件更能说明问题） |
+| 图表推荐符合规则 | 同上：四条规则各走一遍真链路，断言具体的 `chart_type`（不是"和规则函数算得一样"——那是拿规则验规则，接错线也照样绿） |
+| 结果为空不推荐图表、提示"无数据" | 同上：问一个年份越界的问句（种子数据 2024 年起），断言 `row_count == 0`、`chart_type is None`、`message == "无数据"` |
+
+规则的逐条正反例另在 `tests/test_visualization.py` 里用纯函数覆盖（不碰图、不碰 LLM），
+四条规则之外的边界——整数时间列、标识列、bool 列、全 NULL 列、退化行——都在那边。
+
 ## 目录结构
 
 ```
@@ -528,11 +604,12 @@ data-agent/
 ├── conf/
 │   ├── app_config.yaml        基础配置（非敏感默认值）
 │   └── meta_config.yaml       元数据知识库定义（阶段 4）
-├── prompts/                   提示词文件（8 个，与 TDD 6 的表格对应）
+├── prompts/                   提示词文件（9 个，与 TDD 6 的表格对应）
 ├── app/
 │   ├── api/                   接口层：middleware / health / v1 路由
 │   ├── agent/                 智能体层：graph、state、context、events、llm、
-│   │                          prompts、parsing、knowledge、rendering、nodes/，
+│   │                          prompts、parsing、knowledge、rendering、
+│   │                          visualization（图表推荐规则，纯函数）、nodes/，
 │   │                          以及会话状态：checkpoint（选型/降级）、redis_checkpointer
 │   ├── retrievers/            dense / fulltext / fusion / candidate + retrieval 网关
 │   ├── clients/               外部连接生命周期管理（MySQL / Qdrant / ES / Redis / LLM / 重排）

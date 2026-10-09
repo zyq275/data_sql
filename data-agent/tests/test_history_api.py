@@ -189,7 +189,9 @@ async def test_detail_carries_the_six_required_fields() -> None:
     assert data["query_text"] == "看详情"
     assert data["generated_sql"].startswith("SELECT quarter")
     assert data["result_preview"]["columns"] == ["quarter", "amount"]
-    assert "explain_text" in data, "自然语言解释由阶段 8 产出，字段现在如实为空"
+    # 解释由阶段 8 的 generate_explain 节点写。这里只验字段存在：
+    # 该节点是 P1 能力且允许降级，值为 None 表示"这次没解释"，不是缺陷
+    assert "explain_text" in data
     assert data["duration_ms"] == 2500
     assert data["status"] == "success"
     assert data["created_at"]

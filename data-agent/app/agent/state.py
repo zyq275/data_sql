@@ -87,6 +87,16 @@ class QueryState(TypedDict, total=False):
     """结果是否因 max_result_rows 被截断（BR-SQL-004）。截断了就要如实说，
     否则用户会把"前 10000 行"当成"全部"。"""
 
+    # ---- generate_explain / recommend_visualization（阶段 8）----
+    explain_text: str | None
+    """自然语言解释。**None 表示"这次没有解释"，不是"还没生成"**：解释是 P1 能力，
+    上游 LLM 抖动时整轮问答照常返回结果，只是没有解释（见 nodes/generate_explain）。
+    服务层落库时原样写入 ``message.explain_text`` / ``query_history.explain_text``。"""
+    chart_type: str | None
+    """推荐的图表类型（bar / line / pie / table），None 表示不推荐（结果为空）。
+    只进 ``viz`` 事件，**不落库**：表结构里没有对应列（TDD 8.1 的阶段 2 定稿），
+    而它完全由结果结构决定，需要时用同一份 result_preview 重算即可，存一份反而会旧。"""
+
 
 def initial_state(query: str, *, session_id: str | None = None, history: list[dict] | None = None) -> QueryState:
     """构建入口状态。
@@ -109,4 +119,8 @@ def initial_state(query: str, *, session_id: str | None = None, history: list[di
         rows=[],
         row_count=0,
         truncated=False,
+        # 一并给上初值：图若在 execute_sql 之前就失败了，下游读到的应是
+        # "没有解释"而不是 KeyError（同 resolved_query 的处置，见上）
+        explain_text=None,
+        chart_type=None,
     )

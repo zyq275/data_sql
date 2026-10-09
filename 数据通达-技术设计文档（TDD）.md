@@ -110,7 +110,8 @@ data-agent/                        # 后端
 │   │   ├── prompts.py             # 提示词装载与占位符渲染
 │   │   ├── parsing.py             # 模型 JSON 输出的容错解析
 │   │   ├── knowledge.py           # 表/字段/指标口径获取
-│   │   ├── rendering.py           # 上下文拼装（表结构/指标/日期/库环境）
+│   │   ├── rendering.py           # 上下文拼装（表结构/指标/日期/库环境/结果摘要）
+│   │   ├── visualization.py       # 图表类型推荐规则（纯函数，阶段 8）
 │   │   └── nodes/*.py             # 各节点
 │   ├── retrievers/                # 检索层：dense/fulltext/fusion/candidate + retrieval 网关
 │   ├── clients/                   # 连接管理器
@@ -227,6 +228,8 @@ recall_column        recall_value                  recall_metric
 | correction_count | int | SQL 校正次数，初值 0，上限 3（BR-SQL-005） |
 | error | str \| None | validate_sql 写回，驱动条件边分流 |
 | error_code | int \| None | 与 error 配套的业务码（12.1），供 SSE 的 error 事件使用 |
+| explain_text | str \| None | generate_explain 写回；None 表示"这一轮没有解释"，不是"还没生成" |
+| chart_type | str \| None | recommend_visualization 写回；仅用于推事件，**不落库**（见阶段 8 实现范围）|
 
 > **阶段 5 的实现范围**：图上只做 `resolve_reference` 之后、`generate_explain` 之前的
 > 那一段（十二个节点），不存在 checkpointer 与 resolve_reference（阶段 7 引入），
@@ -240,6 +243,19 @@ recall_column        recall_value                  recall_metric
 > 多轮走**两张不同的编译图**，理由见 §5.3.1。`generate_explain` 与
 > `recommend_visualization` 仍留待阶段 8，所以 `message.explain_text` 与
 > `query_history.explain_text` 现在如实写 NULL，不拿 EXPLAIN 语句充数。
+>
+> **阶段 8 的实现范围**：补上 `generate_explain` 与 `recommend_visualization`
+> （15 个节点齐了），两者串行接在 `execute_sql` 之后；`execute_sql` 之前那十三个
+> 节点一行未改。两处落点值得记明：
+>
+> - `explain` 是 **P1 且允许降级**——`execute_sql` 早已把结果推给前端，此刻模型抖动
+>   不该判死整轮问答，因此 `generate_explain` 捕获 `LLMServiceError` 后写回
+>   `explain_text=None`、不推事件，`done` 照常。它**不受** §5.3 中 `resolve_reference`
+>   那类长度上限的约束：解释是链路终点（不回流进任何提示词），输出长度是用户可读性问题，
+>   不是提示词放大问题。
+> - `message.explain_text` 与 `query_history.explain_text` 自此真实写入，阶段 7 的
+>   NULL 占位到此关闭。`chart_type` **不落库**：阶段 2 的 DDL 里没有对应列，而它完全
+>   由结果结构决定，凭同一份 `result_preview` 可重算——存一份只会与结果脱节。
 
 ### 5.2 混合检索流程
 
@@ -395,7 +411,7 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
                      │  resolve → extract → 混合检索 → merge → filter → context
                      │  generate → validate → (correct) → execute → explain → visualize
                      ▼
-              结果/SQL/解释事件 → 前端渲染
+              SQL/结果/解释/图表事件 → 前端渲染
                      │
                      ▼
               异步落 query_history + 会话状态（失败不影响主流程）
@@ -418,7 +434,7 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
 | generate_sql | 生成 SQL | 纯文本 SQL |
 | correct_sql | 修正 SQL | 纯文本 SQL |
 | generate_explain | 生成解释 | 纯文本 |
-| recommend_visualization | 图表类型推荐 | JSON 对象 |
+| recommend_visualization | 图表类型推荐 | JSON 对象 —— **阶段 8 未按提示词实现，见下** |
 
 ### 核心提示词示例（generate_sql）
 
@@ -455,6 +471,15 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
 形态逐个替换，因此 JSON 结构示例里的花括号（`{"tables": [...]}`）原样保留——
 这也是渲染不走 `str.format` 的原因：format 会把示例里的花括号当成未转义占位符直接报错，
 而要求作者写成 `{{` `}}` 又极易被改坏。
+
+**`recommend_visualization` 改用规则实现，不走提示词**（阶段 8 的有意偏离）：
+本表原先列了这份提示词，实现时改为 `app/agent/visualization.py` 里的纯函数。三条理由——
+(a) FR-VIZ-001 的验收标准本身就是一张规则表，"推荐符合规则"只有把规则写进代码才验得了，
+交给模型则同一份结果今天推柱状、明天推折线；(b) "按结果结构推荐"是结构化查表，
+不需要语义理解，模型在这里只增加延迟、成本与不确定性；(c) 它因此是编排图上唯一
+**不会失败**的节点，无需降级路径。规则表见 README「可解释性与可视化推荐（阶段 8）」。
+若日后要按业务语义调整推荐（例如"看构成"改成"看趋势"），那是产品决策，届时再评估
+是否值得引入模型——现在的规则是可解释、可回归的。
 
 **相对时间由代码算，不交给模型**：`date_info` 是一张由代码生成的换算表
 （今天 / 昨天 / 近 7 天 / 本月 / 上月 / 本季度 / 上季度 / 今年 / 去年…），
@@ -514,17 +539,23 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
 | sql | 生成的 SQL | sql |
 | result | 查询结果 | data.columns、data.rows、data.row_count、data.truncated |
 | explain | 自然语言解释 | text |
-| viz | 图表类型推荐 | chart_type |
+| viz | 图表类型推荐 | chart_type（bar / line / pie / table / null）、message |
 | error | 出错 | code（业务码，见 12.1）、message |
 | done | 本次问答正常结束 | correction_count、row_count |
 
 传输采用标准 SSE 帧：`event: <type>` 行 + `data: <json>` 行 + 空行。`data` 里同时保留
 `type` 字段，使单帧脱离上下文也可读。
 
-事件发出者分工（阶段 5 起）：
+事件发出者分工：
 
 - `progress` 由节点自己推（进入推 start、正常返回推 done，step 用节点名）；
 - `sql` / `result` 由 execute_sql 推（sql 先于 result，前端可先展示语句再等结果集）；
+- `explain` / `viz` 由产出它们的节点自己推（阶段 8 起）：`generate_explain`、
+  `recommend_visualization`。这条"谁算出来谁推"是阶段 8 立的规矩——服务层只兜终态，
+  不再替节点代推产出型事件，否则每加一个产出节点就得改一遍服务层。
+  成功一轮的实际次序：`sql → result → explain → viz → done`。其中 `explain` 允许缺席
+  （P1 降级，见 §5.1 阶段 8 实现范围），前端据此不渲染解释区即可；
+  `viz` 必定出现，无数据时 `chart_type` 为 null 且 `message` 明说"无数据"；
 - `error` **只由服务层在终态推一次**——校正循环中间会有多次校验失败，逐个推事件会让
   前端弹出一串马上被修好的错误。终态无错则推 `done`。
 - 开流之后不再回改 HTTP 状态码（响应头已发出），所有失败一律走 `error` 事件；

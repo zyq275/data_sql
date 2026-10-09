@@ -18,8 +18,15 @@ START → resolve_reference → extract_keywords ─┬→ recall_column ─┐
                                  correct_sql ←── 未通过且 correction_count < 3 ┤
                                                                             │
                                  execute_sql ←────────── 通过 ────────────────┤
-                                                                            │
-                                 END ←──────── 未通过且 correction_count ≥ 3 ─┘
+                                       │                                    │
+                                       ▼                                    │
+                                generate_explain                            │
+                                       │                                    │
+                                       ▼                                    │
+                            recommend_visualization                         │
+                                       │                                    │
+                                       ▼                                    │
+                                      END ←─── 未通过且 correction_count ≥ 3 ─┘
 ```
 
 **并行分支的合并语义**：三路召回、两个 filter 都用 ``add_edge([...], next)`` 这种
@@ -34,6 +41,11 @@ START → resolve_reference → extract_keywords ─┬→ recall_column ─┐
 
 **阶段 7 起挂 checkpointer**：编译时带上它，运行时用 ``thread_id=会话 id``
 指定线程，于是同一会话的每一轮都读写同一份状态快照（ADR-006）。
+
+**阶段 8 在 execute_sql 之后接了两个节点**（解释与图表推荐）。它们放在执行之后
+而不是之前，是因为两者都要看真实结果才谈得上"一致"；串行而不并行，
+是因为一个要调模型、一个是纯计算，并行省下的时间抵不上事件次序变得不确定的代价
+（见下方边的注释）。
 """
 
 from __future__ import annotations
@@ -51,11 +63,13 @@ from app.agent.nodes import (
     extract_keywords,
     filter_metric,
     filter_table,
+    generate_explain,
     generate_sql,
     merge_retrieved_info,
     recall_column,
     recall_metric,
     recall_value,
+    recommend_visualization,
     resolve_reference,
     validate_sql,
 )
@@ -111,6 +125,8 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     builder.add_node("validate_sql", validate_sql)
     builder.add_node("correct_sql", correct_sql)
     builder.add_node("execute_sql", execute_sql)
+    builder.add_node("generate_explain", generate_explain)
+    builder.add_node("recommend_visualization", recommend_visualization)
 
     builder.add_edge(START, "resolve_reference")
     builder.add_edge("resolve_reference", "extract_keywords")
@@ -139,7 +155,13 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     )
     # 回边：改完重新校验，计数器在 correct_sql 里增长，由上面的条件边兜底
     builder.add_edge("correct_sql", "validate_sql")
-    builder.add_edge("execute_sql", END)
+    # 执行之后依次补解释与图表推荐（阶段 8）。两者串行而非并行：
+    # generate_explain 是 LLM 调用、recommend_visualization 是纯计算，
+    # 并行省下的那点时间抵不上"两个节点同时往一个流里写事件"引入的次序不确定。
+    # 顺序固定为解释在前、图表在后，前端因此可以假定 viz 到达时解释已经到手。
+    builder.add_edge("execute_sql", "generate_explain")
+    builder.add_edge("generate_explain", "recommend_visualization")
+    builder.add_edge("recommend_visualization", END)
 
     return builder.compile(checkpointer=checkpointer)
 

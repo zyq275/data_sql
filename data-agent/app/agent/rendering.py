@@ -1,9 +1,12 @@
-"""把知识库实体渲染成提示词片段（TDD 6 的 ``{table_infos}`` / ``{metric_infos}`` /
-``{date_info}`` / ``{db_info}``）。
+"""把知识库实体与查询结果渲染成提示词片段（TDD 6 的 ``{table_infos}`` /
+``{metric_infos}`` / ``{date_info}`` / ``{db_info}``，以及阶段 8 的解释节点用的
+结果摘要）。
 
 渲染与节点分开，一是因为同一份文本被多个节点复用（filter 与 generate 都要表结构），
 二是这些函数是**纯函数**——日期换算这类最容易算错的逻辑可以脱离 LLM、脱离数据库
-直接测，不必等到跑通整条链路才发现"上个月"算错了。
+直接测，不必等到跑通整条链路才发现"上个月"算错了。阶段 8 的 ``result_summary_text``
+同属此列：截断标记有没有如实带出去、空结果有没有说清楚，都不该等到跑一遍真模型
+才看得出来。
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import calendar
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
+from typing import Any
 
 import sqlparse
 
@@ -24,6 +28,13 @@ from app.retrievers.retrieval import Candidate
 #: 才是生成 SQL 时真正需要篇幅的部分，被历史挤掉会让 SQL 质量悄悄下滑。
 MAX_HISTORY_TURNS = 5
 EMPTY = "（无）"
+
+#: 给解释节点看的结果样本行数。取 5：解释要的是"这些列是量还是额、大概什么量级"，
+#: 三五行足以判断；再多只是把 token 白送给模型。
+MAX_EXPLAIN_SAMPLE_ROWS = 5
+#: 单格渲染出来的长度上限。结果里可能有长文本列（商品名、备注），
+#: 一格几百字会把样本挤成一片噪声。
+MAX_EXPLAIN_CELL_CHARS = 40
 
 #: 没有会话历史时给模型的说明。刻意与 EMPTY 区分开：EMPTY 表达"这一类东西是空的"，
 #: 而这里要表达的是"这是第一轮"，它直接决定 resolve_reference 该不该改写。
@@ -210,6 +221,66 @@ def history_text(turns: Sequence[dict]) -> str:
                 lines.append(f"  过滤条件：{condition}")
         blocks.append("\n".join(lines))
     return "\n".join(blocks)
+
+
+def result_summary_text(
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    *,
+    row_count: int,
+    truncated: bool,
+    sample_rows: int = MAX_EXPLAIN_SAMPLE_ROWS,
+) -> str:
+    """把结果集渲染成给解释节点看的摘要。
+
+    **为什么要带结果**：解释要"与 SQL 实际逻辑一致"（阶段 8 验收标准 2），
+    而只看 SQL 是判不出这点的——``COUNT(*)`` 里写的条件和结果里真实筛出多少条，
+    只有后者能证明前者说对了。带上行数与几行样本，模型写的解释才有据可依，
+    而不是把 SQL 换个说法复述一遍。
+
+    **为什么只放几行**：这是提示词，不是结果页。一次上万行的查询照原样塞进去，
+    每轮问答都白付一遍 token，而解释所需的信息（列名叫什么、值是量还是额）
+    前三五行就够。
+
+    **所以必须写明"这只是给你参考的样本"**：模型的措辞会跟着提示词走，样本被称作
+    "前几行数据"，它就写出"上面展示的只是前几行，并非全部数据"——而用户那边
+    12 行是全的，这句话凭空把一次完整的结果说成了截断的。样本是给模型看的，
+    与用户看到多少行无关，这层区别得由这里说清楚（真被截断时另有一句，见下）。
+
+    **为什么单独列出 truncated**：少了它，模型会照着 ``row_count`` 写出"共 N 条"
+    这种话，而那个 N 是被截断后的行数（BR-SQL-004）。用户看到"共 10000 条"
+    会当成真实总数——这正是当初不肯把截断藏起来的原因，不能在提示词这一环又漏掉。
+    """
+    if not columns:
+        return EMPTY
+
+    lines = [f"返回行数：{row_count}"]
+    if truncated:
+        lines.append(
+            "注意：结果**已被截断**，上面这个行数是被截断后的数量，不是真实总数。"
+        )
+    lines.append(f"字段：{'、'.join(columns)}")
+    if not rows:
+        lines.append("数据：本次查询没有任何符合条件的记录（0 行）。")
+        return "\n".join(lines)
+
+    lines.append(
+        f"以下 {min(sample_rows, len(rows))} 行只是给你判断字段含义的**参考样本**，"
+        "不是用户看到的全部内容；除非上面说了结果被截断，否则不要向用户描述"
+        "「只显示了部分数据」。"
+    )
+    for row in rows[:sample_rows]:
+        cells = "、".join(_cell(value) for value in row)
+        lines.append(f"  - {cells}")
+    return "\n".join(lines)
+
+
+def _cell(value: Any) -> str:
+    """把结果里的一格渲染成一个短字符串。"""
+    if value is None:
+        return "NULL"
+    text = str(value)
+    return text if len(text) <= MAX_EXPLAIN_CELL_CHARS else text[:MAX_EXPLAIN_CELL_CHARS] + "…"
 
 
 def table_candidates_text(tables: Sequence[TableSpec]) -> str:

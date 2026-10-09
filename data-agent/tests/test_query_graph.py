@@ -18,7 +18,7 @@ from app.agent.graph import build_graph, route_after_validate
 from app.agent.knowledge import MetricSpec, TableSpec
 from app.agent.parsing import parse_json_array, parse_json_object
 from app.agent.prompts import placeholders, render
-from app.agent.rendering import date_info_text
+from app.agent.rendering import date_info_text, result_summary_text
 from app.agent.state import MAX_SQL_CORRECTIONS, initial_state
 from app.core.exceptions import LLMServiceError, ServiceError
 from app.core.text import strip_code_fence
@@ -46,6 +46,9 @@ METRIC = MetricSpec(
     time_range=None,
 )
 CORRECTING_MARKER = "执行前的校验中失败"
+#: 桩模型对解释提示词的回复。**刻意是一句自然语言**，且不含 SELECT 之类的关键字——
+#: 见 StubLLM 里那一支的说明。
+EXPLAIN_TEXT = "关联订单表，按省份分组并对订单金额求和。"
 
 
 class StubLLM:
@@ -55,8 +58,11 @@ class StubLLM:
     按内容分派从根上避开这件事，也顺带验证了各节点的提示词确实是各自那一份。
     """
 
-    def __init__(self, *, sql: str = "SELECT province FROM fact_order") -> None:
+    def __init__(
+        self, *, sql: str = "SELECT province FROM fact_order", explain_fails: bool = False
+    ) -> None:
         self.sql = sql
+        self.explain_fails = explain_fails
         self.calls: list[str] = []
 
     async def text(self, prompt: str, *, system: str | None = None) -> str:
@@ -78,6 +84,14 @@ class StubLLM:
             # 留着这一支是为了将来给用例补上历史时，不会把桩 SQL 当成
             # "改写后的问句"回灌给下游，那种错会表现为"生成 SQL 用的问题变成了 SQL 本身"
             return "去年华东区销售额前三的省份"
+        if "数据解释专家" in prompt:
+            # 解释节点（阶段 8）。注意它拿到的是**已经生成好的 SQL**，
+            # 而这里的返回值必须是一句自然语言，不能是 SQL——若这一支漏掉，
+            # 它会落到下面的 return self.sql，于是"解释"变成一串 SQL，
+            # 而解释节点的所有断言（非空、进了 explain_text）照样全绿。
+            if self.explain_fails:
+                raise LLMServiceError("解释时上游抖动")
+            return EXPLAIN_TEXT
         return self.sql  # generate_sql 与 correct_sql 都返回同一个桩 SQL
 
 
@@ -130,20 +144,37 @@ class StubDw:
 
     async def execute(self, sql):
         self.executed.append(sql)
-        return QueryResult(columns=["province"], rows=[["上海市", 560890.86]], truncated=False)
+        # 列名与行宽必须对得上：阶段 8 的图表规则按列判角色，一列名字配两个值
+        # 会让第二列根本不存在（"province" 是维度、没有度量），推荐静默变成表格。
+        # 这种不自洽在只测事件顺序时看不出来，加了结构敏感的下游才会暴露。
+        return QueryResult(
+            columns=["province", "order_amount"],
+            rows=[["上海市", 560890.86]],
+            truncated=False,
+        )
 
 
-def stub_context(*, sql: str = "SELECT province FROM fact_order", fail_explain: bool = False):
+def stub_context(
+    *,
+    sql: str = "SELECT province FROM fact_order",
+    fail_explain: bool = False,
+    explain_fails: bool = False,
+):
     return SimpleNamespace(
         user_id="u1",
-        llm=StubLLM(sql=sql),
+        llm=StubLLM(sql=sql, explain_fails=explain_fails),
         knowledge=StubKnowledge(),
         retrieval=StubRetrieval(),
         dw=StubDw(fail_explain=fail_explain),
     )
 
 
-async def run_graph(*, sql: str = "SELECT province FROM fact_order", fail_explain: bool = False):
+async def run_graph(
+    *,
+    sql: str = "SELECT province FROM fact_order",
+    fail_explain: bool = False,
+    explain_fails: bool = False,
+):
     """跑一遍图，返回（自定事件列表, 终态）。"""
     graph = build_graph()
     state = initial_state("去年华东区销售额前三的省份")
@@ -152,7 +183,9 @@ async def run_graph(*, sql: str = "SELECT province FROM fact_order", fail_explai
     async for mode, chunk in graph.astream(
         state,
         stream_mode=["custom", "values"],
-        context=stub_context(sql=sql, fail_explain=fail_explain),
+        context=stub_context(
+            sql=sql, fail_explain=fail_explain, explain_fails=explain_fails
+        ),
     ):
         if mode == "custom":
             events.append(chunk)
@@ -187,7 +220,7 @@ def test_route_gives_up_at_the_limit() -> None:
 # ==========================================================================
 
 
-def test_graph_contains_exactly_the_thirteen_documented_nodes() -> None:
+def test_graph_contains_exactly_the_fifteen_documented_nodes() -> None:
     """图的节点集合即 TDD 5.1 的编排图本身。
 
     写死一份清单而不是从 TDD 里读：这份断言要守的正是"代码里的图与文档里的图一致"，
@@ -209,6 +242,8 @@ def test_graph_contains_exactly_the_thirteen_documented_nodes() -> None:
         "validate_sql",
         "correct_sql",
         "execute_sql",
+        "generate_explain",
+        "recommend_visualization",
     }
 
 
@@ -226,16 +261,70 @@ async def test_happy_path_emits_sql_then_result_then_finishes_without_error() ->
     # 成功路径上不该出现 error 事件（error 只由服务层在终局推）
     assert kinds.count("error") == 0
     assert kinds.index("sql") < kinds.index("result"), "sql 应先于 result，前端才能立刻展示语句"
+    # 阶段 8：解释与图表推荐各一条，且都排在 result 之后（它们要看着结果说话）
+    assert kinds.count("explain") == 1
+    assert kinds.count("viz") == 1
+    assert kinds.index("result") < kinds.index("explain") < kinds.index("viz")
     assert final["error"] is None
     assert final["row_count"] == 1
     assert final["sql"] == "SELECT province FROM fact_order"
+
+
+async def test_happy_path_carries_the_explanation_into_the_final_state() -> None:
+    """解释要落在终态里——服务层就是从这里（或事件里）把它写进库的。
+
+    只断言事件里有是不够的：``_persist`` 读的是 ``trace.explain or
+    final["explain_text"]``，两处都断掉时历史里的解释会静默变成 NULL，
+    而事件流看起来完全正常。
+    """
+    _events, final = await run_graph()
+
+    assert final["explain_text"] == EXPLAIN_TEXT
+
+
+async def test_explanation_failure_still_delivers_the_answer() -> None:
+    """解释失败不能拖垮整轮问答——结果已经推给用户了。
+
+    这是阶段 8 最要紧的一条降级：解释是 P1，而 ``execute_sql`` 早就把 result
+    推出去了。若这里的异常往上冒，用户会看到一个完整的答案之后连接被掐断，
+    拿次要的东西否掉了主要的东西。
+
+    断言"没有 explain 事件"而不只是"没报错"：解释为空时前端要据此不渲染解释区。
+    """
+    events, final = await run_graph(explain_fails=True)
+    kinds = [e["type"] for e in events]
+
+    assert kinds.count("sql") == 1
+    assert kinds.count("result") == 1
+    assert kinds.count("explain") == 0, "拿不到解释就不该推一条空事件"
+    assert final["explain_text"] is None, "如实留空，而不是拿 SQL 或占位符充数"
+    assert final["row_count"] == 1, "结果本身必须照常返回"
+    # 解释挂了，后面的图表推荐照跑：两者串行但互不依赖
+    assert kinds.count("viz") == 1
+
+
+async def test_viz_reads_the_result_not_the_question() -> None:
+    """图表类型由结果结构决定，桩结果是一维一量、非时间、非占比 → 柱状图。"""
+    events, final = await run_graph()
+
+    viz = next(e for e in events if e["type"] == "viz")
+    assert viz["chart_type"] == "bar"
+    assert viz["message"], "viz 事件要带一句给人看的说明"
+    assert final["chart_type"] == "bar"
 
 
 async def test_every_node_reports_start_and_done() -> None:
     events, _final = await run_graph()
     progress = [(e["step"], e["status"]) for e in events if e["type"] == "progress"]
 
-    for node in ("extract_keywords", "merge_retrieved_info", "add_extra_context", "execute_sql"):
+    for node in (
+        "extract_keywords",
+        "merge_retrieved_info",
+        "add_extra_context",
+        "execute_sql",
+        "generate_explain",
+        "recommend_visualization",
+    ):
         assert (node, "start") in progress
         assert (node, "done") in progress
     # 三路召回与两个 filter 都是并行分支，各自都要有进度
@@ -309,6 +398,7 @@ PROMPT_CONTRACT: dict[str, set[str]] = {
         "conversation_history",
     },
     "correct_sql": {"query", "sql", "error", "table_infos", "metric_infos", "date_info", "db_info"},
+    "generate_explain": {"query", "sql", "result"},
 }
 
 SAMPLE_VALUES = {
@@ -323,6 +413,7 @@ SAMPLE_VALUES = {
     "error": "E",
     "history": "H",
     "conversation_history": "H",
+    "result": "R",
 }
 
 
@@ -406,3 +497,53 @@ def test_date_info_gives_the_model_a_table_to_copy_from() -> None:
 def test_date_info_answers_the_acceptance_question() -> None:
     """验收问句里的"去年"必须能在上下文里直接查到，模型不必自己算。"""
     assert "去年：2024-01-01 ~ 2024-12-31" in date_info_text(datetime(2025, 6, 1, 0, 0))
+
+
+# ==========================================================================
+# 结果摘要的渲染（阶段 8 的解释节点用）
+# ==========================================================================
+
+
+def test_result_summary_carries_the_row_count_and_columns() -> None:
+    text = result_summary_text(
+        ["year", "quarter", "amount"],
+        [[2024, 1, 120300.0], [2024, 2, 138900.0]],
+        row_count=2,
+        truncated=False,
+    )
+
+    assert "返回行数：2" in text
+    assert "year" in text and "quarter" in text and "amount" in text
+    assert "2024" in text
+
+
+def test_result_summary_caps_the_sample_rows() -> None:
+    """只放几行：这是提示词，不是结果页。"""
+    rows = [[index, float(index)] for index in range(50)]
+    text = result_summary_text(["id", "amount"], rows, row_count=50, truncated=False)
+
+    assert text.count("  - ") == 5
+
+
+def test_result_summary_says_so_when_truncated() -> None:
+    """少这一句，模型会照着 row_count 写出"共 N 条"，而那是被截断后的数。"""
+    text = result_summary_text(["province"], [["上海市"]], row_count=10000, truncated=True)
+
+    assert "截断" in text
+
+
+def test_result_summary_states_an_empty_result_plainly() -> None:
+    """0 行要明说。空着的话模型会自己编一段"结果如下"。"""
+    text = result_summary_text(["province", "amount"], [], row_count=0, truncated=False)
+
+    assert "返回行数：0" in text
+    assert "没有任何符合条件的记录" in text
+
+
+def test_result_summary_renders_null_and_long_cells_compactly() -> None:
+    text = result_summary_text(
+        ["name", "note"], [["张三", None], ["李四", "很长" * 60]], row_count=2, truncated=False
+    )
+
+    assert "NULL" in text
+    assert "…" in text, "超长的一格要截短，否则几行样本就能把提示词撑满"

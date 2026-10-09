@@ -33,7 +33,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.context import QueryContext
-from app.agent.events import DONE, ERROR, RESULT, SQL
+from app.agent.events import DONE, ERROR, EXPLAIN, RESULT, SQL
 from app.agent.graph import get_graph
 from app.agent.rendering import MAX_HISTORY_TURNS
 from app.agent.state import MAX_SQL_CORRECTIONS, QueryState, initial_state
@@ -243,6 +243,10 @@ class QueryService:
         try:
             sql = trace.sql or final.get("sql")
             preview = _preview(trace.result)
+            # 与 sql 同一个写法：以推出去的那一份为准，图终态是退路。
+            # 两处都取不到就是 None——**这一次确实没有解释**（LLM 抖动时如实留空），
+            # 与"还没生成"是两回事，前端与历史详情据此区分（见 state.explain_text）
+            explain = trace.explain or final.get("explain_text") or None
 
             if conversation is not None:
                 await self.messages.add_turn(
@@ -252,9 +256,7 @@ class QueryService:
                     query_text=query,
                     generated_sql=sql,
                     result_preview=preview,
-                    # 自然语言解释由阶段 8 的 explain 节点产出，此处如实留空，
-                    # 不拿 EXPLAIN 语句充数（那是校验用的语句，不是解释）
-                    explain_text=None,
+                    explain_text=explain,
                 )
                 await self.conversation_repo.touch(conversation)
 
@@ -264,7 +266,7 @@ class QueryService:
                 query_text=query,
                 generated_sql=sql,
                 result_preview=preview,
-                explain_text=None,
+                explain_text=explain,
                 status=STATUS_SUCCESS if ok else STATUS_FAILED,
                 duration_ms=duration_ms,
             )
@@ -298,17 +300,21 @@ class QueryService:
 
 
 class _Trace:
-    """从事件流里捡出这一轮最终生效的 SQL 与结果集。
+    """从事件流里捡出这一轮最终生效的 SQL、结果集与解释。
 
     落库写的是**用户实际看到的那一份**，而不是图终态里的那一份：两者在正常情况下
     相同，但当图在 generate_sql 之后、execute_sql 之前失败时，终态里没有 ``sql``
     而事件已经推出去过——这时该记的是推出去的那条，否则历史里会留下
     "用户看到过 SQL、历史里却空空如也"的记录。
+
+    解释（阶段 8）同属此列，且理由更直白：它由节点的 try/except 决定推或不推，
+    事件里有没有它**就是**"这次有没有解释"的唯一权威。
     """
 
     def __init__(self) -> None:
         self.sql: str | None = None
         self.result: dict | None = None
+        self.explain: str | None = None
 
     def observe(self, event: dict) -> None:
         kind = event.get("type")
@@ -318,6 +324,9 @@ class _Trace:
             data = event.get("data")
             if isinstance(data, dict):
                 self.result = data
+        elif kind == EXPLAIN:
+            text = event.get("text")
+            self.explain = text if isinstance(text, str) and text else None
 
 
 def _thread_config(session_id: str | None) -> dict | None:

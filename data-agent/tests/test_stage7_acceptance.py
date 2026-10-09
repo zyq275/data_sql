@@ -322,7 +322,9 @@ async def test_a_real_query_is_recorded_into_both_the_conversation_and_the_histo
     assert detail["generated_sql"] == sql
     assert detail["status"] == "success"
     assert detail["duration_ms"] is not None
-    assert "explain_text" in detail, "自然语言解释由阶段 8 产出，字段现在如实为空"
+    # 解释由阶段 8 的 generate_explain 节点写。这里只验字段存在：
+    # 该节点是 P1 能力且允许降级，值为 None 表示"这次没解释"，不是缺陷
+    assert "explain_text" in detail
     preview = detail["result_preview"]
     assert preview["columns"] == result["columns"], "结果预览要与用户看到的结果对得上"
     assert preview["row_count"] == result["row_count"]
