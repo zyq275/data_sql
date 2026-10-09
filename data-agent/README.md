@@ -230,7 +230,7 @@ QDRANT__LOCAL_PATH=D:\agent\infra\qdrant-local-data
 不生效（只影响按字段过滤的性能，过滤语义不变），且数据落在本地目录。
 
 **Rerank（可选，阶段 6）** —— 任何返回 `[{index, score}]` 或
-`{"results":[{index, relevance_score}]}` 的重排端点都能接，改 `.env` 的
+`{"results":[{"index","relevance_score"}]}` 的重排端点都能接，改 `.env` 的
 `RERANK__HOST` / `RERANK__PATH` / `RERANK__MODEL` 即可（云服务的 Key 填
 `RERANK__API_KEY`）。**没部署就不要留着默认值**：
 
@@ -238,8 +238,31 @@ QDRANT__LOCAL_PATH=D:\agent\infra\qdrant-local-data
 RERANK__ENABLED=false
 ```
 
-否则每次查询都会因连不上而打一条 WARNING。功能不受影响（降级为 RRF 顺序），
-但日志会脏。
+否则每次查询都会白等约 0.5 秒（连接被拒后重试一次 + backoff）并打一条 WARNING。
+功能不受影响（降级为 RRF 顺序），但代价是白等。
+
+本机实际用的是 **llama.cpp + bge-reranker-v2-m3（Q8_0，606MB）**，全程离线：
+
+```
+D:\agent\infra\start-rerank.cmd          # 一键起，监听 127.0.0.1:8002
+```
+
+它对应的正是 `.env` 里 `RERANK__HOST=http://127.0.0.1:8002`，所以本机不用改任何配置。
+手工起就是这一条：
+
+```bash
+D:\agent\infra\llama-cpp\llama-server.exe \
+  -m D:\agent\infra\models\bge-reranker-v2-m3-Q8_0.gguf \
+  --rerank --host 127.0.0.1 --port 8002
+```
+
+`--rerank` 不可省（它同时把 pooling 切到 rank）。实测每条召回多 0.85 秒
+（20 条候选约 1.1 秒），一条问答有字段、指标两路走精排，合计约 +1.7 秒。
+
+关于分数的两点提醒，都是实测过的：**分数是原始 logit，不在 0~1 之间、可能是负数**
+——下游只拿它排序，没有任何地方跟阈值比较，所以没问题，但别在别处按 `score > 0.5`
+之类的口径用它；**换线程数会改变分数**（12 线程 0.3796 / 单线程 0.3991，同一输入），
+这是浮点归约顺序的差异，同一实例内可复现，判序不受影响（同一批候选下 GMV 恒在销量前）。
 
 ### 3. 构建
 
@@ -387,11 +410,15 @@ k=60 时第 1 名与第 2 名只差 ≈0.0003，而另一路投的一票 ≥1/61
 |---|---|
 | 两路召回结果经 RRF 融合 | `pytest tests/test_stage6_acceptance.py -v -s`：逐条候选核对融合分是否等于两路名次倒数之和，并断言共识命中排在单路命中之前 |
 | rerank 精排后相关项位于不相关项之前 | 同上：用本地桩重排服务（按文档内容打分）断言网关确实按精排分数重排；桩也记录了送到服务端的文档，比对建库原文 |
+| 同上，但用真实重排模型 | 起 `start-rerank.cmd` 后跑 `pytest tests/test_stage6_acceptance.py -m requires_rerank -v -s`：断言问"销售额"时 GMV 排在销量之前 |
 | 召回命中率达标 | 同上：19 条语料（指标 5 / 字段 7 / 取值 5）实测召回@3 与 top-1 均为 100%，门槛为 100% / 85% |
 
-第一条与第三条必须真跑两路索引（`pytest -m requires_stack`）；第二条用桩服务，
-因为本环境没有重排服务，而"用桩测出模型排得对"是自欺。真实精排质量由
-`-m requires_rerank` 的用例覆盖（配了服务才会跑），最终由阶段 10 的评测集度量。
+第一条与第三条必须真跑两路索引（`pytest -m requires_stack`）；第二条用桩，
+因为桩能测"网关有没有按服务的分数重排"，而**用桩测出"模型排得对"是自欺**，
+所以精排质量单独用 `-m requires_rerank` 对着真模型测。该用例在没起服务时会跳过
+（并说明缺什么），起了就是实跑——写这份 README 时它已经在 llama.cpp 上跑通。
+更全面的精排质量仍由阶段 10 的评测集度量。
+
 
 ## 目录结构
 

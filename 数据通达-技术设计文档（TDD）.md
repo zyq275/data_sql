@@ -290,8 +290,21 @@ ES 的 `text` 字段，doc id 两处都用 MySQL 的 uuid 主键。于是：合�
 
 **已知局限与归属**：向量那一路至今仍把"销售额"排给 `sales_quantity` 而非 `GMV`
 （§8.3 记录的近同义词问题），融合后 GMV 回到第一——这是本阶段唯一可量化的质量提升，
-由 `test_the_fulltext_path_fixes_the_near_synonym_case` 钉住。至于重排模型本身的排序
-质量，桩服务只能证明机制通了，真实效果由阶段 10 的评测集度量。
+由 `test_the_fulltext_path_fixes_the_near_synonym_case` 钉住。
+
+**真实重排服务的部署形态**：本机用 llama.cpp 的 `llama-server --rerank` 加载
+`bge-reranker-v2-m3` 的 Q8_0 GGUF（606MB），监听 127.0.0.1:8002（即 `.env` 里
+`RERANK__HOST` 的默认值，故本机无需改配置），启动脚本 `infra/start-rerank.cmd`。
+llama.cpp 的响应形状是 `{"results":[{"index","relevance_score"}]}`，与客户端
+`_parse` 天然吻合。**它返回的是原始 logit，不在 0~1 之间、可能为负**——下游只用它
+排序、不与阈值比较，因此安全；但任何新增的"按分数过滤"都必须先意识到这一点。
+另有一条实测结论：线程数不同会改变分数（12 线程 0.3796 / 单线程 0.3991，同一输入），
+属浮点归约顺序差异，同一实例内可复现，不影响判序。
+
+桩服务能证明的是"网关按服务的分数重排、且送进去的是库里的原文"；模型**排得对**
+由 `@pytest.mark.requires_rerank` 的用例对着真模型断言（没起服务时跳过）。
+更全面的精排质量仍由阶段 10 的评测集度量。
+
 
 ### 5.3 多轮会话流程
 
