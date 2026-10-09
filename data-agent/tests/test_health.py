@@ -62,17 +62,41 @@ async def test_readiness_reports_every_check_with_status_and_detail() -> None:
         assert result["status"] in {"ok", "fail", "skipped"}
 
 
-async def test_readiness_marks_redis_as_skipped_not_ok() -> None:
-    """Redis 到阶段 6 才接入，必须如实报 skipped。
+async def test_readiness_probes_redis_instead_of_deferring_it() -> None:
+    """Redis 自阶段 7 起是真探测的（ADR-006，会话 checkpointer）。
 
-    伪报 ok 就等于把这个依赖的故障推迟到线上才发现——探针存在的意义就是
-    让未探测与探测通过两者可区分。
+    刻意不断言它是 ok：有没有 Redis 取决于跑测试的机器，而这条用例要在两种机器上
+    都成立。要断言的是"探过了"——``skipped`` 表示没探，那正是这里要防的：
+    把"未探测"和"探测通过"混为一谈，等于把这个依赖的故障推迟到线上才发现。
     """
     async with _client() as client:
         checks = (await client.get("/health/ready")).json()["checks"]
 
-    assert checks["redis"]["status"] == "skipped"
-    assert "阶段 6" in checks["redis"]["detail"]
+    assert checks["redis"]["status"] in {"ok", "fail"}
+
+
+async def test_redis_check_really_sends_a_ping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redis 探针必须真发一次命令。
+
+    只建客户端对象是不连的（``Redis.from_url`` 惰性连接），探针照着写就会
+    永远报 ok——那正是它要防的那种谎报。
+    """
+    from app.api import health
+    from app.clients import redis as redis_client
+
+    calls = 0
+
+    async def _fake_ping() -> str:
+        nonlocal calls
+        calls += 1
+        return "PONG"
+
+    monkeypatch.setattr(redis_client, "ping", _fake_ping)
+
+    detail = await health._check_redis()
+
+    assert calls == 1
+    assert "PONG" in detail
 
 
 # --------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from app.clients.embedding import dispose_client as dispose_embedding
 from app.clients.es import dispose_es
 from app.clients.mysql import dispose_engine
 from app.clients.qdrant import dispose_qdrant
+from app.clients.redis import dispose_redis
 from app.clients.rerank import dispose_client as dispose_rerank
 from app.core.config import Settings, get_settings
 from app.core.handlers import register_exception_handlers
@@ -46,7 +47,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """优雅启停钩子。
 
     各客户端都按需惰性创建（app.clients.*），此处只负责停机释放——连不上的
-    依赖不该拖住启动。Redis 在阶段 6 接入时一并纳入（TDD 第 10 章）。
+    依赖不该拖住启动。Redis 自阶段 7 起纳入（会话 checkpointer，ADR-006）。
     """
     settings = get_settings()
     print(f"[startup] {settings.app.name} v{settings.app.version} (debug={settings.app.debug})")
@@ -55,6 +56,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await dispose_qdrant()
     await dispose_es()
     await dispose_embedding()
+    # checkpointer 持有 Redis 连接；不关会在测试与热重载里累积成"连接未关闭"告警
+    await dispose_redis()
     # 重排客户端只在真的启用精排时才会被创建（惰性），dispose 对未创建的客户端是空操作
     await dispose_rerank()
     # LLM 客户端持有 httpx 连接池，不关会在测试与热重载里累积成"连接未关闭"告警

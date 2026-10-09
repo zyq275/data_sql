@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 6 混合检索（两路召回 + RRF 融合 + rerank 精排）**。
+当前进度：**阶段 7 多轮会话与查询历史**。
 
 ## 环境要求
 
@@ -64,12 +64,13 @@ ADMIN_PASSWORD='<自定口令>' .venv/Scripts/python.exe -m app.scripts.init_adm
 - 服务地址：http://127.0.0.1:8000
 - 交互文档：http://127.0.0.1:8000/docs
 - 存活探针：`GET /health`（进程活着就 200，不碰外部依赖）
-- 就绪探针：`GET /health/ready`（逐项探测 MySQL meta/dw、Qdrant、ES、Embedding；
+- 就绪探针：`GET /health/ready`（逐项探测 MySQL meta/dw、Qdrant、ES、Embedding、Redis；
   任一不可用返回 503，并列出每一项的状态与失败原因）
 
 就绪探针每项有独立超时（默认 3s，Embedding 10s——冷启动要加载权重）。
 探针挂起比探针失败更糟：编排器等不到结论，既不敢摘流量也不敢放流量。
-Redis 到阶段 6 才接入，当前如实报 `skipped` 而不是伪报 ok。
+自阶段 7 起 Redis 纳入探测（真发一次 `PING`，报的还是它自己 `enabled`/连接的那份配置，
+不是进程内的选型结果）：多轮会话的图状态要靠它持久化，探测的就是这份依赖。
 
 ## 数据库迁移
 
@@ -93,7 +94,7 @@ uv pip install -e ".[dev]"            # 测试依赖
 .venv/Scripts/python.exe -m pytest    # 全量
 ```
 
-分三类：
+按依赖分几类：
 
 - **纯逻辑测试**（配置解析、探针骨架、口令脱敏、SQL 只读校验、图的拓扑与校正回边、
   RRF 融合与重排客户端）不需要任何外部服务，随时可跑；
@@ -102,15 +103,18 @@ uv pip install -e ".[dev]"            # 测试依赖
 - 需要真调大模型的用例标 `requires_llm`，`.env` 里没配真实的 `LLM__API_KEY` 时跳过；
 - 需要真调重排模型的用例标 `requires_rerank`，没配或连不上时跳过。它**不并进
   `requires_stack`**：重排是可选依赖，把它算进"外部依赖"会把所有 requires_stack
-  的用例一并跳掉，比故障本身更糟。
+  的用例一并跳掉，比故障本身更糟；
+- 需要真实 Redis（会话状态持久化）的用例标 `requires_redis`，同样不并进
+  `requires_stack`——同上，Redis 没起不该让整批用例变成"跳过"。
 
 跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
 那是真问题，测试必须失败，不会被跳过掩盖。
 
-跑阶段 5 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
+跑阶段 5 / 阶段 7 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/test_stage5_acceptance.py -v -s
+.venv/Scripts/python.exe -m pytest tests/test_stage7_acceptance.py -v -s
 ```
 
 ## 验证清单（阶段 1 验收）
@@ -122,7 +126,7 @@ uv pip install -e ".[dev]"            # 测试依赖
 | CORS 通配符被拦截 | 生产模式（`APP__DEBUG=false`）下设 `CORS_ORIGINS=["*"]`，启动即报错 |
 | Alembic 能执行一次空迁移 | `alembic upgrade head`（需先建库并配置口令） |
 
-## 接口清单（阶段 3 + 阶段 5）
+## 接口清单（阶段 3 + 阶段 5 + 阶段 7）
 
 | 方法 | 路径 | 鉴权 |
 |---|---|---|
@@ -130,7 +134,14 @@ uv pip install -e ".[dev]"            # 测试依赖
 | POST | `/api/v1/auth/refresh` | 无（refresh_token 走请求体） |
 | GET | `/api/v1/auth/me` | Bearer |
 | PUT | `/api/v1/auth/password` | Bearer |
-| POST | `/api/v1/query` | Bearer（SSE 流式返回） |
+| POST | `/api/v1/query` | Bearer（SSE 流式返回；带 `session_id` 即多轮） |
+| POST | `/api/v1/conversations` | Bearer |
+| GET | `/api/v1/conversations` | Bearer（`page`/`page_size`） |
+| GET | `/api/v1/conversations/{id}` | Bearer（含该会话的消息列表） |
+| DELETE | `/api/v1/conversations/{id}` | Bearer |
+| GET | `/api/v1/history` | Bearer（`page`/`page_size`/`status`/`keyword`） |
+| GET | `/api/v1/history/{id}` | Bearer |
+| DELETE | `/api/v1/history/{id}` | Bearer |
 | GET | `/api/v1/admin/users` | admin（支持 `page`/`page_size`/`keyword`） |
 | POST | `/api/v1/admin/users` | admin |
 | PUT | `/api/v1/admin/users/{id}/role` | admin |
@@ -263,6 +274,32 @@ D:\agent\infra\llama-cpp\llama-server.exe \
 ——下游只拿它排序，没有任何地方跟阈值比较，所以没问题，但别在别处按 `score > 0.5`
 之类的口径用它；**换线程数会改变分数**（12 线程 0.3796 / 单线程 0.3991，同一输入），
 这是浮点归约顺序的差异，同一实例内可复现，判序不受影响（同一批候选下 GMV 恒在销量前）。
+
+**Redis（阶段 7，多轮会话状态）** —— 会话的图状态快照存在 Redis 里（ADR-006）：
+
+```
+D:\agent\infra\start-redis.cmd           # 一键起，监听 127.0.0.1:6379
+```
+
+本机用的是 **Redis 8.10.2 的 Windows 便携版（msys2 构建）**，解压在 `infra/redis/`
+下，不需要 Docker、也不需要 WSL。它对应的正是 `.env` 里 `REDIS__HOST=127.0.0.1`，
+所以本机不用改配置。启动参数里关掉了持久化（`--save "" --appendonly no`）：
+这里存的只是**还活着**的会话的状态快照，会话一删就随之丢弃（
+`agent.checkpoint.release_thread`），重启丢掉的是一次进行中的追问，不是用户数据——
+会话消息与查询历史都在 MySQL 里，不受影响。
+
+`redis.enabled=false` 或连不上时**不阻塞问答**：checkpointer 降级为进程内
+`InMemorySaver`，单进程内语义完全相同，只是进程一停图状态就没了（用户看到的多轮
+对话仍然正常，因为上文是从 MySQL 的 `message` 表读的，与这里无关）。降级会打一条
+WARNING，`/health/ready` 的 `redis` 项则如实报 `fail`。**降级在首次选型时定下就不再
+翻转**，Redis 中途起来也要重启进程才会切回去（checkpointer 是编译图时烘进图里的）。
+
+**为什么不用 `langgraph-checkpoint-redis`**：那个官方包硬依赖 RediSearch 与 RedisJSON
+两个模块（建索引、存 JSON 都用它），而 Windows 便携版不带这两个模块
+（`FT.INFO` 直接报 unknown command），装上也起不来。`app/agent/redis_checkpointer.py`
+只用 string / list / set 这些基础结构，按 `BaseCheckpointSaver` 的接口实现，
+语义照抄 `InMemorySaver`（含重放去重与版本号规则），可选项 `prefix`、`allowlist` 见
+TDD 11。代价是快照以序列化后的字节存放在列表里，服务端不可查询——本阶段不需要查。
 
 ### 3. 构建
 
@@ -419,6 +456,67 @@ k=60 时第 1 名与第 2 名只差 ≈0.0003，而另一路投的一票 ≥1/61
 （并说明缺什么），起了就是实跑——写这份 README 时它已经在 llama.cpp 上跑通。
 更全面的精排质量仍由阶段 10 的评测集度量。
 
+## 多轮会话与查询历史（阶段 7）
+
+`/api/v1/query` 多了一个可选参数 `session_id`：带上它就是这轮会话的下一轮，
+不带就是一次性提问。两组新接口（会话、历史）都按 `user_id` 隔离，
+**越权一律按"资源不存在"返回 404，而不是 403**——403 等于承认"这个 id 确实存在，
+只是不归你"，那是一条可以被逐个 id 问出来的信息。
+
+| 文件 | 职责 |
+|---|---|
+| `agent/nodes/resolve_reference.py` | 图的入口节点：结合上文把"只看华东"补成完整问句 |
+| `agent/checkpoint.py` | checkpointer 选型与降级（Redis → 内存），`release_thread` |
+| `agent/redis_checkpointer.py` | 自研 Redis 版 `BaseCheckpointSaver` |
+| `repositories/ids.py` | 时间有序主键（会话消息与历史共用） |
+| `repositories/conversation.py` | 会话与消息的读写 |
+| `repositories/query_history.py` | 查询历史的分页/筛选/详情 |
+| `services/conversation_service.py` / `services/history_service.py` | 归属校验与编排 |
+| `prompts/resolve_reference.prompt` | 改写提示词，输出纯文本 |
+
+**改写放在图的入口，而不是并进关键字抽取**。它的产出同时被三路召回、两个筛选、
+生成 SQL 与校正六处消费；藏在 `extract_keywords` 里的话，那六处都得自己判断
+"手里的是原文还是改写后的"。放在入口，这件事只发生一次、只有一个出口，
+而且"这一轮到底改写了什么"在日志里是一条独立、可对照的记录。
+首轮**由代码判断历史为空即原样透传**，一次模型调用都不发：让模型面对空历史去
+"决定要不要改写"，它偶尔会把一个本来完整的问题改坏（补出一个历史里根本没有的年份）。
+
+**为什么编译两张图**。langgraph 规定：挂了 checkpointer 的图必须有 `thread_id`。
+一次性提问没有会话 id，硬凑一个的话，每问一句都会在 Redis 里留下一个永不回收的
+线程；而 `checkpointer=None` 的图又不能带 `config`。所以 `agent.graph.get_graph(persist=...)`
+按需编译并缓存两张——多轮用带 checkpointer 的那张，单轮用不带的。
+
+**开流前必须做完的事**。SSE 的响应头在第一个事件推出去时就发出去了，此后 HTTP 状态码
+已经定型；"会话不存在""这个会话不归你"若发生在流里，就只能表现为**连接被掐断**。
+所以归属校验、取上文、选 checkpointer 全部挪进 `QueryService.prepare()`，在开流之前
+做完。流一旦开始，所有失败都只能变成 `type=error` 事件。
+
+**一轮一行、role=assistant**。问题与它自己的答案写在同一行里，拆成 user / assistant
+两行看起来更规范，但 MySQL 的 `DATETIME` 只到秒，同一秒内写入的两行无法可靠定序——
+一旦反过来，上文就会把上一轮的问题配到这一轮的 SQL 上。同一理由也决定了主键形态
+（`repositories/ids.py`：13 位毫秒时间戳 + 16 位随机），排序全靠主键自己，
+不依赖 `created_at`。消息行、会话活跃时间、查询历史行**一次提交**写出，
+分开提交只会得到"会话详情里看得到这一轮、历史列表里却少一条"这种半份记录。
+
+## 验证清单（阶段 7 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 问"各季度销售额"后追问"只看华东"能理解上下文 | `pytest tests/test_stage7_acceptance.py -v`：断言追问生成的 SQL 里仍有第一轮那张事实表（没换主题），并且带上了 `华东` 这个新条件 |
+| 指代消解改写成独立问句，首轮原样透传 | 同上（`-m requires_llm`）：直接调节点 + 真模型，断言改写结果同时含上一轮主题与本轮新条件；无历史时断言返回值与输入逐字相同 |
+| 会话状态持久化，重启后可继续 | 同上：用**另一个** checkpointer 实例（新对象、新连接）去 Redis 读回该 thread 的状态 |
+| 会话仅本人可见；详情返回消息列表 | 同上：换一个用户去读详情、列列表、并拿该 `session_id` 提问，三处都必须 404 |
+| 历史列表分页、可按状态/关键词筛选、仅本人可见 | 同上：`page_size=1` 只返回一条；`keyword` 命中唯一一条；`status=failed` 为空（这两轮都成功了）；另一个用户看到 0 条 |
+| 历史详情含问题/SQL/结果预览/解释/耗时/状态 | 同上：六项逐一核对，`result_preview` 的列与行数要与 SSE 里 `result` 事件给用户看的那一份对得上 |
+
+验收用例**用的是真模型、真检索、真数仓**：多轮理解对不对只能由端到端结果回答，
+拿桩模型测多轮，测的其实是"我们把上文拼进了提示词"，而拼错了的提示词照样能让桩
+给出预期输出。用例还会真的往 conversation / message / query_history 三张表里写行，
+每个用例用**本次运行专属的 user_id**（`u-acc7-<用例>-<运行随机串>`）——这些表不会
+自动清空（删会话也不删历史，历史本来就是独立的），共用 id 的话"列表里该有几条"
+就会被上一次运行留下的行搅乱，症状是"第一次跑绿、第二次跑红"。
+`tests/test_conversation_api.py` 与 `tests/test_history_api.py` 出于同样的理由
+也带运行随机后缀。
 
 ## 目录结构
 
@@ -430,14 +528,16 @@ data-agent/
 ├── conf/
 │   ├── app_config.yaml        基础配置（非敏感默认值）
 │   └── meta_config.yaml       元数据知识库定义（阶段 4）
-├── prompts/                   提示词文件（7 个，与 TDD 6 的表格对应）
+├── prompts/                   提示词文件（8 个，与 TDD 6 的表格对应）
 ├── app/
 │   ├── api/                   接口层：middleware / health / v1 路由
 │   ├── agent/                 智能体层：graph、state、context、events、llm、
-│   │                          prompts、parsing、knowledge、rendering、nodes/
+│   │                          prompts、parsing、knowledge、rendering、nodes/，
+│   │                          以及会话状态：checkpoint（选型/降级）、redis_checkpointer
 │   ├── retrievers/            dense / fulltext / fusion / candidate + retrieval 网关
-│   ├── clients/               外部连接生命周期管理
-│   ├── repositories/          数据访问层（meta 注入式会话；dw 自开只读连接）
+│   ├── clients/               外部连接生命周期管理（MySQL / Qdrant / ES / Redis / LLM / 重排）
+│   ├── repositories/          数据访问层（meta 注入式会话；dw 自开只读连接；
+│   │                          会话、消息、查询历史）
 │   ├── entities/              领域实体
 │   ├── models/                ORM 模型（阶段 2）
 │   ├── schemas/               请求/响应模型

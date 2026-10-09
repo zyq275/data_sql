@@ -26,10 +26,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent.context import QueryContext
+from app.agent.graph import build_graph
 from app.agent.state import MAX_SQL_CORRECTIONS
 from app.clients.mysql import get_dw_engine
 from app.core.security import get_current_user
-from app.services.query_service import QueryService
+from app.services.query_service import QueryService, TurnContext
 from main import app
 
 pytestmark = pytest.mark.requires_stack
@@ -169,9 +170,20 @@ def patch_context(monkeypatch: pytest.MonkeyPatch, sql: str) -> QueryContext:
 
 
 async def run_with_sql(monkeypatch: pytest.MonkeyPatch, sql: str) -> list[dict]:
-    """走完整的服务层路径（含终局 error 事件的措辞），返回事件序列。"""
+    """走完整的服务层路径（含终局 error 事件的措辞），返回事件序列。
+
+    无会话、不落库（``QueryService()`` 的 session 为 None）：这几条用例验的是
+    安全闸门与错误措辞，与持久化无关。
+    """
     patch_context(monkeypatch, sql)
-    return [event async for event in QueryService().stream(ACCEPTANCE_QUESTION, user_id="u-acceptance")]
+    # 图不带 checkpointer：本用例没有会话，要的是一次性的单轮闭环
+    turn = TurnContext(graph=build_graph())
+    return [
+        e
+        async for e in QueryService().stream(
+            ACCEPTANCE_QUESTION, user_id="u-acceptance", turn=turn
+        )
+    ]
 
 
 @pytest.mark.parametrize(

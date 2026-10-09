@@ -1,19 +1,25 @@
-"""单轮 Text-to-SQL 的图编排（TDD 5.1）。
+"""Text-to-SQL 的图编排（TDD 5.1）。
 
 ```
-START → extract_keywords ─┬→ recall_column ─┐
-                          ├→ recall_value  ─┼→ merge_retrieved_info ─┬→ filter_table  ─┐
-                          └→ recall_metric ─┘                        └→ filter_metric ─┴→ add_extra_context
-                                                                                            ↓
-                                                                                       generate_sql
-                                                                                            ↓
-                                    ┌─────────────────────────────────────────────→ validate_sql
-                                    ↓                                                     │
-                              correct_sql ←─── 未通过且 correction_count < 3 ──────────────┤
-                                                                                          │
-                              execute_sql ←──────────── 通过 ─────────────────────────────┤
-                                                                                          │
-                              END ←────────── 未通过且 correction_count ≥ 3 ──────────────┘
+START → resolve_reference → extract_keywords ─┬→ recall_column ─┐
+                                              ├→ recall_value  ─┼→ merge_retrieved_info
+                                              └→ recall_metric ─┘        │
+                                                       ┌────────────────┴────────────────┐
+                                                       ▼                                 ▼
+                                                  filter_table                    filter_metric
+                                                       └────────────────┬────────────────┘
+                                                                        ▼
+                                                              add_extra_context
+                                                                        ↓
+                                                                  generate_sql
+                                                                        ↓
+                                       ┌───────────────────────────→ validate_sql
+                                       ↓                                    │
+                                 correct_sql ←── 未通过且 correction_count < 3 ┤
+                                                                            │
+                                 execute_sql ←────────── 通过 ────────────────┤
+                                                                            │
+                                 END ←──────── 未通过且 correction_count ≥ 3 ─┘
 ```
 
 **并行分支的合并语义**：三路召回、两个 filter 都用 ``add_edge([...], next)`` 这种
@@ -25,12 +31,16 @@ START → extract_keywords ─┬→ recall_column ─┐
 图上的边即流程，循环以边的形式表达时，"最多三轮"这个约束由条件边显式持有；
 塞进节点内部 while 循环的话，重试次数就藏在某个函数体里，而它恰恰是需要被
 验收、被日志、被未来改动者看见的东西。
+
+**阶段 7 起挂 checkpointer**：编译时带上它，运行时用 ``thread_id=会话 id``
+指定线程，于是同一会话的每一轮都读写同一份状态快照（ADR-006）。
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
+import asyncio
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.context import QueryContext
@@ -46,6 +56,7 @@ from app.agent.nodes import (
     recall_column,
     recall_metric,
     recall_value,
+    resolve_reference,
     validate_sql,
 )
 from app.agent.state import MAX_SQL_CORRECTIONS, QueryState
@@ -74,15 +85,20 @@ def route_after_validate(state: QueryState) -> str:
     return "correct_sql"
 
 
-def build_graph():
-    """构建并编译单轮问答图。
+def build_graph(checkpointer: BaseCheckpointSaver | None = None):
+    """构建并编译问答图。
 
-    本阶段不挂 checkpointer（阶段 7 才有多轮会话）；``compile()`` 出来的对象
-    是**可复用**的：它只持有图的拓扑，所有会话相关的依赖都从 ``context`` 进来，
-    因此进程内建一次即可，不必每次请求重建。
+    ``compile()`` 出来的对象是**可复用**的：它只持有图的拓扑与 checkpointer，
+    所有会话相关的依赖都从 ``context`` 进来，因此进程内建一次即可，
+    不必每次请求重建。
+
+    ``checkpointer`` 取默认值 None 时图不带任何持久化——发一条消息、跑完就丢，
+    这正是测试要的：绝大多数图行为（分支、回边、事件顺序）与会话无关，
+    给它们配上 Redis 只会让测试依赖外部服务。真正带会话的入口是 ``get_graph``。
     """
     builder = StateGraph(QueryState, context_schema=QueryContext)
 
+    builder.add_node("resolve_reference", resolve_reference)
     builder.add_node("extract_keywords", extract_keywords)
     builder.add_node("recall_column", recall_column)
     builder.add_node("recall_value", recall_value)
@@ -96,7 +112,8 @@ def build_graph():
     builder.add_node("correct_sql", correct_sql)
     builder.add_node("execute_sql", execute_sql)
 
-    builder.add_edge(START, "extract_keywords")
+    builder.add_edge(START, "resolve_reference")
+    builder.add_edge("resolve_reference", "extract_keywords")
 
     # 三路召回并行；写法是"扇出 + 汇合"两步，汇合点等齐三个分支
     for node in ("recall_column", "recall_value", "recall_metric"):
@@ -124,15 +141,45 @@ def build_graph():
     builder.add_edge("correct_sql", "validate_sql")
     builder.add_edge("execute_sql", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
-@lru_cache(maxsize=1)
-def get_graph():
-    """进程内共享的编译结果。
+_graphs: dict[bool, object] = {}
+_graph_lock = asyncio.Lock()
+
+
+async def get_graph(*, persist: bool = True):
+    """取进程内共享的编译结果。
+
+    **为什么两张图**：``persist=True`` 的那张挂着 checkpointer，而 langgraph 对
+    挂了 checkpointer 的图**强制要求**每次调用都给 ``thread_id``——给不出来就直接
+    抛错（实测：``Checkpointer requires one or more of the following 'configurable'
+    keys: thread_id, ...``）。一次性提问（不带 session_id）没有线程可归属，只能
+    现编一个，而那样每问一句都会在 Redis 里留下一个永不回收的线程。
+    另编一张不带 checkpointer 的图，既省掉这份垃圾，也让"这次问答不留状态"
+    在调用处一眼可见。
 
     编译有实际开销（校验拓扑、准备各分支），而编译产物只依赖图的静态结构；
     每次请求重建等于白交一遍这份开销。缓存住也顺带保证了"全进程只有一张图"——
     图一旦被误建成可变的（比如往节点里塞状态），多份实例会让问题只在部分请求上出现。
+
+    **为什么是 async**：选 checkpointer 要真连一次 Redis（见 ``agent.checkpoint``），
+    那是 I/O。硬要在同步函数里做，就只能"先假定 Redis 可用、失败了再说"，
+    而失败点会落到某一轮问答的中间。
     """
-    return build_graph()
+    if persist in _graphs:
+        return _graphs[persist]
+    async with _graph_lock:
+        if persist not in _graphs:
+            checkpointer = None
+            if persist:
+                from app.agent.checkpoint import get_checkpointer
+
+                checkpointer = await get_checkpointer()
+            _graphs[persist] = build_graph(checkpointer)
+        return _graphs[persist]
+
+
+def reset_graph() -> None:
+    """丢弃编译结果，下次重新构建。只给测试与显式重连用。"""
+    _graphs.clear()

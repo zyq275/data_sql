@@ -12,11 +12,22 @@ import calendar
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 
+import sqlparse
+
 from app.agent.knowledge import MetricSpec, TableSpec
 from app.core.config import get_settings
 from app.retrievers.retrieval import Candidate
 
+#: 会话历史最多回放多少轮。
+#: 取 5 而不是全部：多轮对话里"那 / 换成"指代的是**最近一轮**（BR-CONV-002），
+#: 更早的轮次对改写几乎没有贡献，却会实打实地挤占提示词预算——表结构与指标口径
+#: 才是生成 SQL 时真正需要篇幅的部分，被历史挤掉会让 SQL 质量悄悄下滑。
+MAX_HISTORY_TURNS = 5
 EMPTY = "（无）"
+
+#: 没有会话历史时给模型的说明。刻意与 EMPTY 区分开：EMPTY 表达"这一类东西是空的"，
+#: 而这里要表达的是"这是第一轮"，它直接决定 resolve_reference 该不该改写。
+NO_HISTORY = "（这是本次会话的第一轮，没有上文）"
 
 
 def _shift_months(day: date, months: int) -> date:
@@ -140,6 +151,65 @@ def metric_infos_text(metrics: Sequence[MetricSpec]) -> str:
             lines.append(f"  时间口径：{metric.time_range}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
+
+
+def where_clause(sql: str | None) -> str | None:
+    """从 SQL 里抠出 WHERE 条件（取不到就返回 None）。
+
+    会话历史要说清"上文问的是什么"，问题原文和 SQL 各自都只说了一半：
+    "各季度销售额"看不出范围，"只看华东"之后 SQL 里的 ``WHERE region='华东'``
+    才是真正的范围。把 WHERE 单独提一行，是因为它会被下一轮的"那 / 换成"直接指代，
+    埋在整条 SQL 里时模型容易只看 SELECT 列而漏掉它。
+
+    按 **token** 定位而不是按字符串找 "WHERE"：后者会被字符串字面量里的同名词
+    （``WHERE note = 'where'``）或注释骗到，切出一段莫名其妙的条件，
+    而这种错误在提示词里完全看不出来——模型会照着一个错的条件去改写问句。
+
+    解析失败一律返回 None 而不是抛错：这只是给提示词锦上添花的一段文本，
+    而这条 SQL 是模型自己生成的、语法偏怪是常有的事，不该让整轮问答失败。
+    """
+    if not sql:
+        return None
+    try:
+        for statement in sqlparse.parse(sql):
+            tokens = list(statement.flatten())
+            for index, token in enumerate(tokens):
+                if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == "WHERE":
+                    # 从 WHERE 起拼到末尾：GROUP BY / ORDER BY 混进来也无妨，
+                    # 它们同样属于"这一轮查询的约束"，多给一点比漏掉安全
+                    clause = "".join(t.value for t in tokens[index:])
+                    normalized = " ".join(clause.split()).rstrip(";").strip()
+                    return normalized or None
+    except Exception:  # noqa: BLE001 —— 纯属尽力而为
+        return None
+    return None
+
+
+def history_text(turns: Sequence[dict]) -> str:
+    """把会话历史渲染成提示词片段（TDD 5.3：上文问题 / SQL / 过滤条件）。
+
+    没有历史时返回一句明确的说明，而不是空串：空串在提示词里表现为这一段凭空消失，
+    模型无从区分"这是第一轮"与"历史没取到"。这两者的处置完全相反——前者应当原样
+    透传，后者若被当成前者，用户会看到"那华东呢"被当作一个完整问题直接去查。
+    """
+    if not turns:
+        return NO_HISTORY
+
+    blocks: list[str] = []
+    for index, turn in enumerate(turns[-MAX_HISTORY_TURNS:], start=1):
+        lines = [f"第 {index} 轮"]
+        query = (turn.get("query") or "").strip()
+        if query:
+            lines.append(f"  问题：{query}")
+        sql = (turn.get("sql") or "").strip()
+        if sql:
+            # 折成一行：SQL 里的换行在提示词中不承载语义，却会让"第 N 轮"的缩进错乱
+            lines.append(f"  SQL：{' '.join(sql.split())}")
+            condition = where_clause(sql)
+            if condition:
+                lines.append(f"  过滤条件：{condition}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
 
 
 def table_candidates_text(tables: Sequence[TableSpec]) -> str:

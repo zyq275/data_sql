@@ -24,5 +24,5 @@ class QueryRequest(BaseModel):
     )
     session_id: str | None = Field(
         default=None,
-        description="会话标识；阶段 5 尚未启用（阶段 7 接入 checkpointer 后生效）",
+        description="会话标识（POST /conversations 返回的 id）；不传即为一次性提问",
     )

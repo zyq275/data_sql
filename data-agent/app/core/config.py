@@ -167,8 +167,17 @@ class ElasticsearchSettings(BaseModel):
 
 
 class RedisSettings(BaseModel):
-    """会话 checkpointer 与缓存（ADR-006）。"""
+    """会话 checkpointer 与缓存（ADR-006）。
 
+    ``enabled`` 与 ``RerankSettings.enabled`` 同一条理由：Redis 的可用性有两种
+    表达方式——"没配"和"配了但连不上"，而后者每次都要白等一轮连接超时。
+    开关显式化，运维不必靠"配一个连不上的地址"来表达"本机没有 Redis"。
+
+    关掉之后会话状态降级为进程内 MemorySaver（见 ``agent.checkpoint``）：
+    单实例开发不受影响，多实例部署与进程重启后的状态恢复会失效。
+    """
+
+    enabled: bool = True
     host: str = "127.0.0.1"
     port: int = 6379
     password: str = ""

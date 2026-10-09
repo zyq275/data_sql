@@ -12,10 +12,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1 import admin_users, auth, query
+from app.api.v1 import admin_users, auth, conversation, history, query
 
 router = APIRouter()
 
 router.include_router(auth.router)
 router.include_router(admin_users.router)
 router.include_router(query.router)
+router.include_router(conversation.router)
+router.include_router(history.router)

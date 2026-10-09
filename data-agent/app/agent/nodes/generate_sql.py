@@ -28,6 +28,7 @@ async def generate_sql(state: QueryState, runtime: Runtime[QueryContext]) -> dic
         metric_infos=state.get("metric_text", ""),
         date_info=state.get("date_text", ""),
         db_info=state.get("db_text", ""),
+        conversation_history=state.get("history_text", ""),
         query=state["resolved_query"],
     )
     raw = await runtime.context.llm.text(prompt)

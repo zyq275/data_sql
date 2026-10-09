@@ -102,6 +102,8 @@ data-agent/                        # 后端
 │   │   └── v1/{auth,conversation,query,history,admin,permission,eval}.py
 │   ├── agent/                     # 智能体层
 │   │   ├── graph.py               # 图编排（带 checkpointer）
+│   │   ├── checkpoint.py          # checkpointer 选型与降级（阶段 7）
+│   │   ├── redis_checkpointer.py  # 自研 Redis 版 BaseCheckpointSaver（阶段 7）
 │   │   ├── state.py / context.py
 │   │   ├── events.py              # SSE 事件构造与节点进度上报
 │   │   ├── llm.py                 # LLM 实例
@@ -232,6 +234,12 @@ recall_column        recall_value                  recall_metric
 > `resolved_query` 直接填成 `query`，而**所有下游节点一律只读 `resolved_query`**：
 > 阶段 7 只需把"原样透传"换成"指代消解"，十二个节点一行都不用改；反过来若阶段 5
 > 图省事让下游读 `query`，阶段 7 就得挨个改且极易漏掉某一处。
+>
+> **阶段 7 的实现范围**：补上入口的 `resolve_reference`（13 个节点齐了）与 Redis
+> checkpointer，下游那十二个节点确实一行未改。一次性提问（不带 `session_id`）与
+> 多轮走**两张不同的编译图**，理由见 §5.3.1。`generate_explain` 与
+> `recommend_visualization` 仍留待阶段 8，所以 `message.explain_text` 与
+> `query_history.explain_text` 现在如实写 NULL，不拿 EXPLAIN 语句充数。
 
 ### 5.2 混合检索流程
 
@@ -323,6 +331,57 @@ llama.cpp 的响应形状是 `{"results":[{"index","relevance_score"}]}`，与�
         ▼
   生成新结果 → 写回会话状态（message）→ 落 query_history
 ```
+
+#### 5.3.1 实现说明（阶段 7）
+
+| 文件 | 职责 |
+|---|---|
+| `agent/nodes/resolve_reference.py` | 入口节点：读 `history` 把本轮问题补成完整问句 |
+| `prompts/resolve_reference.prompt` | 改写提示词，**输出纯文本**（改写后的问句），不要 JSON、不要解释 |
+| `agent/checkpoint.py` | checkpointer 选型（Redis / 内存降级）、`release_thread` |
+| `agent/redis_checkpointer.py` | 自研 Redis 版 `BaseCheckpointSaver`（ADR-006） |
+| `repositories/conversation.py` / `query_history.py` | 会话、消息、历史三张表的读写 |
+| `repositories/ids.py` | 时间有序主键，会话消息与查询历史共用 |
+| `services/conversation_service.py` / `history_service.py` | 归属校验与编排 |
+
+**改写为什么单独占一个节点**：它的产出被三路召回、两个筛选、生成 SQL、校正六处
+消费。藏在 `extract_keywords` 里的话，那六处都得自己判断"手里的是原文还是改写后的"。
+放在入口，这件事只发生一次、只有一个出口，"这一轮改写了什么"在日志里是一条独立、
+可对照的记录。**首轮由代码判断历史为空并原样透传**，一次模型调用都不发：没有历史
+时任何改写都是凭空发挥，让模型自己"决定要不要改写"，它偶尔会把一个本来完整的
+问题改坏（补出一个历史里根本没有的年份）。
+
+**为什么编译两张图**。langgraph 规定挂了 checkpointer 的图必须有 `thread_id`。
+一次性提问没有会话 id，硬凑一个的话，每问一句都会在 Redis 里留下一个永不回收的
+线程（会话 id 是 uuid4，不会有第二个会话复用它），而 `checkpointer=None` 的图又
+不能带 `config`。所以 `agent.graph.get_graph(persist=...)` 按需编译并缓存两张。
+
+**开流前必须做完的事**。SSE 的响应头在第一个事件推出去时就发出去了（
+`StreamingResponse` 先发 `http.response.start` 再拉第一块内容），此后 HTTP 状态码
+已经定型。"会话不存在""这个会话不归你"若发生在流里，就只能表现为**连接被掐断**——
+没有状态码、没有原因，而 §7.1 要求它们是一个正常的 404 信封（§12.2 的"统一异常
+转 JSON"在这里落不了地，因为那时响应头已经发出去了）。所以归属校验、取上文、
+选 checkpointer 全部挪进 `QueryService.prepare()`，在开流之前做完；流一旦开始，
+所有失败都只能变成 `type=error` 事件。落地路径就是 `GET`/`DELETE` 会话与历史一律
+**越权按"不存在"返回 404 而非 403**——403 等于承认这个 id 存在、只是不归你。
+
+**一轮一行、role=assistant**。问题与它自己的答案写在同一行里，拆成 user / assistant
+两行看起来更规范，但 MySQL 的 `DATETIME` **精度只到秒**，同一秒内写入的两行
+`created_at` 完全相同，按它排序得到的次序是数据库说不上来的；顺序一旦反过来，
+上文就会把上一轮的问题配到这一轮的 SQL 上。所以：(1) 一轮只落一行；
+(2) 主键用"13 位毫秒时间戳 + 16 位随机"自带顺序（`repositories/ids.py`），
+排序用主键而不是 `created_at`，它保证跨毫秒严格按时间先后，同一毫秒内次序稳定
+（无需保证真实先后：真实链路上两轮相隔的是一次完整问答，量级是秒）。
+消息行、会话 `updated_at`、查询历史行**一次提交**写出，分开提交只会得到
+"会话详情里看得到这一轮、历史列表里却少一条"这种半份记录。落库失败只记日志
+（NFR-STAB-003）：用户已经看到答案了，此刻抛异常只会让他看到完整答案之后连接被掐断。
+
+**持久化与清理**。图状态以 `session_id` 作 `thread_id` 存在 Redis（ADR-006），
+删会话时调 `checkpoint.release_thread` 丢弃快照，否则 Redis 里的线程只增不减。
+Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同，丢的是跨重启的
+图状态；用户看到的多轮对话仍然正常，因为上文是从 MySQL 的 `message` 表读的。
+**降级在首次选型时定下就不再翻转**（checkpointer 是编译图时烘进图里的，
+中途换一个就得重编译图，而"正在跑的请求"与"新编译的图"会落在两个不同的 state 上）。
 
 ### 5.4 端到端时序
 
@@ -802,6 +861,24 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 
 ### ADR-006 会话采用 LangGraph checkpointer + Redis
 - **理由**：复用状态快照能力，Redis 保证多实例共享与低延迟，重启可恢复。
+- **阶段 7 补充（checkpointer 自己实现，不用 `langgraph-checkpoint-redis`）**：
+  该官方包硬依赖 RediSearch 与 RedisJSON 两个模块（建索引、存 JSON 都用它），
+  而 Windows 便携版不带这两个模块（`FT.INFO` 报 unknown command），装上也起不来。
+  `app/agent/redis_checkpointer.py` 只用 string / list / set 这些基础结构，按
+  `BaseCheckpointSaver` 的接口实现，语义照抄 `InMemorySaver`（含重放去重与版本号
+  规则）。代价是快照以序列化后的字节存放在列表里、服务端不可查询，本阶段不需要查。
+  两条容易踩的坑记在这里：**msgpack 把数组一律解成 list**，从列表里读回的
+  `(task_id, channel)` 直接塞进 set 会抛 `TypeError: unhashable type: 'list'`
+  （去重时必须先 `tuple()`）；**客户端不能开 `decode_responses=True`**，
+  快照是二进制载荷，按文本解码会损坏它。序列化要登记应用自定义类型
+  （`Candidate` / `TableSpec` / `MetricSpec` 等），登记表在 `agent/checkpoint.py`
+  的 `STATE_TYPES`——不登记现在只打告警，未来 langgraph 会直接拒绝。
+- **阶段 7 补充（降级）**：Redis 不可用时不阻塞问答，checkpointer 退为进程内
+  `InMemorySaver`（单进程内语义相同，丢的是跨重启的图状态）。这条降级成立的前提是
+  **会话消息本身在 MySQL 的 `message` 表**，与 checkpointer 无关：用户看到的多轮
+  对话从 SQL 落库那一侧读，降级丢掉的只是每个节点后的中间态快照（状态回放与调试
+  用得上）。所以"重启后能接着聊"在降级下依然成立，而 `/health/ready` 会如实报
+  `fail`，不会悄悄降级成人人以为有、其实没有的持久化。
 
 ### ADR-007 混合检索采用 RRF + rerank
 - **理由**：RRF 无需调权、对异构分数鲁棒；rerank 交叉编码提升排序精度。
@@ -822,7 +899,7 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 | 请求追踪 | 中间件 uuid 注入 ContextVar，loguru patch |
 | 链路追踪 | OpenTelemetry 采集，Langfuse 追踪 LLM 调用 |
 | 安全防护 | 见"安全设计" |
-| 健康探针 | /health 存活；/health/ready 逐项探测 MySQL(meta/dw)、Qdrant、ES、Embedding，任一不可用返 503（Redis 阶段 7 接入，先如实报 skipped）。ES 一项只在三个索引齐备时算就绪，但缺索引不判 failed——它属于"没建库"而非"服务故障"，如实报"已建 N/3"更利于定位；Rerank 是可选依赖，不参与就绪判定 |
+| 健康探针 | /health 存活；/health/ready 逐项探测 MySQL(meta/dw)、Qdrant、ES、Embedding、Redis（阶段 7 起接入，真发一次 PING，报的是它自己 `enabled`/连接的那份配置而不是进程内的选型结果），任一不可用返 503。ES 一项只在三个索引齐备时算就绪，但缺索引不判 failed——它属于"没建库"而非"服务故障"，如实报"已建 N/3"更利于定位；Rerank 是可选依赖，不参与就绪判定 |
 | 优雅启停 | lifespan 中 init/close ClientManager |
 | 超时与重试 | LLM 超时+重试；SQL max_execution_time + 行数上限 |
 | 日志分级 | loguru 文件+控制台，rotation/retention 配置化 |
@@ -845,7 +922,7 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 | qdrant.local_path | — | env（mode=local 时必填） |
 | es.scheme / host / port | http / 9200 | YAML |
 | es.value_index / column_index / metric_index | data-agent-value / data-agent-column-text / data-agent-metric-text | YAML |
-| redis.host / port / password | 6379 | env |
+| redis.enabled / host / port / db / password | true / 127.0.0.1 / 6379 / 0 | YAML / env（password） |
 | sql_security.max_execution_time_ms / max_result_rows | 30000 / 10000 | 配置 |
 | cors_origins | 白名单 | env |
 
@@ -864,6 +941,14 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 > `.env`，与 LLM/数据库口令同级对待，不进代码与 YAML。没有部署重排服务时应显式
 > 设 `RERANK__ENABLED=false`——否则每次查询都会因连不上而打一条 WARNING（功能正常，
 > 但日志会脏）。协议适配见 §5.2.1。
+>
+> **redis**：`enabled` 与 `rerank.enabled` 同一条理由——Redis 的可用性有两种表达
+> 方式，"没配"和"配了但连不上"，而后者每次都要白等一轮连接超时，所以开关显式化，
+> 运维不必靠"配一个连不上的地址"来表达"本机没有 Redis"。置 false 则会话状态退回
+> 进程内存储（见 ADR-006 的阶段 7 补充）。`password` 走环境变量 `REDIS__PASSWORD`，
+> 只写入 `.env`，与 LLM/数据库口令同级对待。仅 Redis 用作缓存时需要选 `db`，
+> 本阶段只用 0 号库，checkpointer 的键统一带 `prefix`（默认 `checkpoint`），
+> 不与将来可能的缓存用途混在一个命名空间里。
 
 ---
 

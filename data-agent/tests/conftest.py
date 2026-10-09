@@ -60,6 +60,10 @@ def missing_dependencies() -> dict[str, str]:
     所以它不该出现在"外部依赖未就绪就跳过"的名单里——那会把所有
     requires_stack 的用例一并跳掉，比故障本身更糟。
     需要真实精排模型的用例单独用 requires_rerank 标记（见 rerank_available）。
+
+    **同样不含 Redis**（阶段 7 起）：它也是可选的，没有它会话状态降级到进程内
+    （见 agent.checkpoint），问答链路照常工作。需要真实 Redis 的用例单独用
+    requires_redis 标记（见 redis_available）。
     """
     from app.core.config import get_settings
 
@@ -115,8 +119,18 @@ def rerank_available() -> bool:
     return _tcp_reachable(hostname, port)
 
 
+def redis_available() -> bool:
+    """Redis 是否可用（开关打开且端口在监听）。"""
+    from app.core.config import get_settings
+
+    settings = get_settings().redis
+    if not settings.enabled:
+        return False
+    return _tcp_reachable(settings.host, settings.port)
+
+
 def pytest_runtest_setup(item: pytest.Item) -> None:
-    """没配真实 LLM Key 时跳过需要真模型调用的用例。
+    """没配真实 LLM Key / Redis 时，各自跳过需要它们的用例。
 
     与 ``requires_stack`` 分开判定、也分开打标：知识库通了不等于模型能调，
     两个条件各自可能单独不满足，合成一个标记会让"为什么跳过"说不清到底缺哪一项。
@@ -128,4 +142,10 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             "没有可用的 Rerank 服务（RERANK__HOST 未监听或已关闭），"
             "跳过需要真实精排模型的用例——精排机制的用例另在 test_hybrid_retrieval "
             "与 test_stage6_acceptance 里用桩服务覆盖"
+        )
+    if "requires_redis" in item.keywords and not redis_available():
+        pytest.skip(
+            "没有可用的 Redis（redis.enabled=false 或 host:port 未监听），"
+            "跳过会话持久化相关的用例——降级到进程内存储的路径另在 "
+            "test_stage7_acceptance 里覆盖"
         )

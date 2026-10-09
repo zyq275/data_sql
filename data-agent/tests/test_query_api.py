@@ -15,9 +15,9 @@ import httpx
 import pytest
 
 from app.api.v1 import query as query_api
-from app.core.exceptions import AppException, QueryError, SQLSecurityError
+from app.core.exceptions import AppException, NotFoundError, QueryError, SQLSecurityError
 from app.core.security import get_current_user
-from app.services.query_service import QueryService
+from app.services.query_service import QueryService, TurnContext
 from main import app
 
 BASE_URL = "http://test"
@@ -82,20 +82,49 @@ async def test_invalid_payload_is_rejected_before_streaming(payload: dict) -> No
     assert resp.json()["code"] == 40000
 
 
+async def test_unknown_session_is_rejected_before_streaming(monkeypatch) -> None:
+    """会话不存在（或不属于本人）也要在开流前拦下，给一个 404 信封。
+
+    SSE 的响应头在第一次迭代事件流时就发出去了，此后改不了状态码。若把归属校验
+    放进流里，越权访问只能表现为连接被掐断——没有状态码、没有原因，
+    而 TDD 7.1 要求它是一条正常的 404。
+    """
+    StubService.SCRIPT = [{"type": "done", "correction_count": 0, "row_count": 0}]
+    monkeypatch.setattr(query_api, "QueryService", StubService)
+
+    async with _client() as client:
+        resp = await client.post(
+            "/api/v1/query", json={"query": "那华东呢", "session_id": "missing"}
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["code"] == 40400
+    assert resp.headers["content-type"].startswith("application/json")
+
+
 # ==========================================================================
 # 开流之后：SSE 帧
 # ==========================================================================
 
 
 class StubService:
-    """按脚本吐事件的服务，用来单独校验接口层的封装。"""
+    """按脚本吐事件的服务，用来单独校验接口层的封装。
+
+    阶段 7 起 ``prepare`` 是接口层在开流前必须调的一步（会话归属校验要给出
+    404 而不是断流），这里一并假掉。
+    """
 
     SCRIPT: list[dict] = []
 
-    def __init__(self) -> None:
+    def __init__(self, session=None) -> None:
         pass
 
-    async def stream(self, query: str, *, user_id: str) -> AsyncIterator[dict]:
+    async def prepare(self, user_id: str, session_id: str | None):
+        if session_id == "missing":
+            raise NotFoundError("会话不存在")
+        return None
+
+    async def stream(self, query: str, *, user_id: str, turn=None) -> AsyncIterator[dict]:
         for event in self.SCRIPT:
             yield event
 
@@ -146,7 +175,7 @@ class ScriptedGraph:
         self.final = final or {}
         self.raises = raises
 
-    async def astream(self, state, stream_mode=None, context=None):
+    async def astream(self, state, stream_mode=None, context=None, config=None):
         for event in self.events:
             yield ("custom", event)
         if self.raises is not None:
@@ -155,7 +184,13 @@ class ScriptedGraph:
 
 
 async def collect(graph) -> list[dict]:
-    return [event async for event in QueryService(graph=graph).stream("问题", user_id="u-1")]
+    """跑一遍假图，只看事件。
+
+    ``QueryService(session=None)`` 即不落库（见那个构造器的说明）：这条用例验证的是
+    "异常怎么变成事件"，与持久化无关，真连库只会把一个纯逻辑用例绑到环境上。
+    """
+    turn = TurnContext(graph=graph)
+    return [e async for e in QueryService().stream("问题", user_id="u-1", turn=turn)]
 
 
 async def test_business_exception_becomes_a_single_error_event() -> None:

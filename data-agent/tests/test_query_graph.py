@@ -72,6 +72,12 @@ class StubLLM:
             return '{"tables":[{"table_name":"fact_order","columns":["province","amount"]}]}'
         if "指标筛选专家" in prompt:
             return '["销售额"]'
+        if "问句改写专家" in prompt:
+            # 指代消解。本文件的用例都不带历史（initial_state 的 history 为空），
+            # 正常走不到这里——无历史时 resolve_reference 原样透传且零模型调用。
+            # 留着这一支是为了将来给用例补上历史时，不会把桩 SQL 当成
+            # "改写后的问句"回灌给下游，那种错会表现为"生成 SQL 用的问题变成了 SQL 本身"
+            return "去年华东区销售额前三的省份"
         return self.sql  # generate_sql 与 correct_sql 都返回同一个桩 SQL
 
 
@@ -181,9 +187,16 @@ def test_route_gives_up_at_the_limit() -> None:
 # ==========================================================================
 
 
-def test_graph_contains_exactly_the_twelve_documented_nodes() -> None:
+def test_graph_contains_exactly_the_thirteen_documented_nodes() -> None:
+    """图的节点集合即 TDD 5.1 的编排图本身。
+
+    写死一份清单而不是从 TDD 里读：这份断言要守的正是"代码里的图与文档里的图一致"，
+    让它去读文档就等于两边一起改、一起错。多一个节点意味着多一次模型调用或一次查库，
+    少一个意味着某段上下文没进提示词——两种都不会报错，只会答得不对。
+    """
     nodes = set(build_graph().get_graph().nodes)
     assert nodes - {"__start__", "__end__"} == {
+        "resolve_reference",
         "extract_keywords",
         "recall_column",
         "recall_value",
@@ -281,12 +294,20 @@ async def test_nothing_is_executed_when_validation_never_passes() -> None:
 #: 而这里要守的是"模板该长什么样"。少一个占位符意味着模型缺一段上下文，
 #: 多一个拼错的占位符会被原样发给模型，两种都不报错、只是答得不对。
 PROMPT_CONTRACT: dict[str, set[str]] = {
+    "resolve_reference": {"history", "query"},
     "extend_keywords_for_column_recall": {"query"},
     "extend_keywords_for_value_recall": {"query"},
     "extend_keywords_for_metric_recall": {"query"},
     "filter_table_info": {"query", "table_candidates"},
     "filter_metric_info": {"query", "metric_candidates"},
-    "generate_sql": {"query", "table_infos", "metric_infos", "date_info", "db_info"},
+    "generate_sql": {
+        "query",
+        "table_infos",
+        "metric_infos",
+        "date_info",
+        "db_info",
+        "conversation_history",
+    },
     "correct_sql": {"query", "sql", "error", "table_infos", "metric_infos", "date_info", "db_info"},
 }
 
@@ -300,6 +321,8 @@ SAMPLE_VALUES = {
     "metric_candidates": "MC",
     "sql": "SELECT 1",
     "error": "E",
+    "history": "H",
+    "conversation_history": "H",
 }
 
 

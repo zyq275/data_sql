@@ -10,8 +10,8 @@ Elasticsearch 取值索引、Embedding 服务（ADR-005）。
 每个探测有独立超时。探针挂起比探针失败更糟——编排器会一直等不到结论，
 既不敢摘流量也不敢放流量，等于把故障从「确定的不可用」变成「不确定的卡死」。
 
-Redis 在阶段 6 才接入（ADR-006），当前显式标记为 ``skipped`` 而不是伪报 ok：
-探针谎报依赖健康，只是把这个依赖的故障推迟到线上才发现。
+Redis 在阶段 7 接入（ADR-006，会话 checkpointer）。此前它被显式标记为 ``skipped``
+而不是伪报 ok——探针谎报依赖健康，只是把这个依赖的故障推迟到线上才发现。
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from fastapi import APIRouter, Response
 from sqlalchemy import text
 
 from app.clients import embedding, es, qdrant
+from app.clients import redis as redis_client
 from app.clients.mysql import get_dw_engine, get_engine
 from app.core.config import get_settings
 
@@ -116,6 +117,18 @@ async def _check_embedding() -> str:
     return f"{get_settings().embedding.host} 正常，维度 {len(vector)}"
 
 
+async def _check_redis() -> str:
+    """真发一次 PING（ADR-006）。
+
+    **探的只是"Redis 作为服务是否可用"，不代表本进程正在用它**：checkpointer
+    的选型在首次使用时定一次就不再翻转（见 agent.checkpoint），Redis 中途恢复
+    也不会切回去，而进程重启才会。所以这里可能报 ok 而本进程仍跑在内存态上——
+    那是选型的语义，不是探针漏报。反过来，报 fail 时确实说明多实例共享与
+    重启恢复这两项已经失效。
+    """
+    return f"{redis_client.safe_url()} 响应 {await redis_client.ping()}"
+
+
 # 用列表而非元组：测试要能替换其中某一项来验证 503 分支
 CHECKS: list[tuple[str, CheckFn, float]] = [
     ("mysql_meta", _check_mysql_meta, DEFAULT_TIMEOUT_SECONDS),
@@ -123,10 +136,12 @@ CHECKS: list[tuple[str, CheckFn, float]] = [
     ("qdrant", _check_qdrant, DEFAULT_TIMEOUT_SECONDS),
     ("es", _check_es, DEFAULT_TIMEOUT_SECONDS),
     ("embedding", _check_embedding, EMBEDDING_TIMEOUT_SECONDS),
+    ("redis", _check_redis, DEFAULT_TIMEOUT_SECONDS),
 ]
 
-# 尚未接入的依赖：如实报告未探测，不伪报 ok。阶段 6 接入后并入 CHECKS（ADR-006）
-DEFERRED_CHECKS: dict[str, str] = {"redis": "阶段 6 接入（ADR-006）"}
+# 尚未接入的依赖：如实报告未探测，不伪报 ok。
+# 阶段 7 起 Redis 已接入（ADR-006），上面 CHECKS 里那一项是真的探测过了。
+DEFERRED_CHECKS: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------
