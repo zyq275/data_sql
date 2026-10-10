@@ -55,7 +55,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     依赖不该拖住启动。Redis 自阶段 7 起纳入（会话 checkpointer，ADR-006）。
     """
     settings = get_settings()
-    logger.info("{} v{} 启动（debug={}）", settings.app.name, settings.app.version, settings.app.debug)
+    # 这里是标准库 logging，占位符必须是 %s：写成 {} 不会当场报错，
+    # 而是在 emit 时才炸（`msg % args` 找不到 % 占位符）——也就是在启动那一刻炸。
+    logger.info("%s v%s 启动（debug=%s）", settings.app.name, settings.app.version, settings.app.debug)
     yield
     # 追踪要在其余资源之前收尾：它要把缓冲区里的 span 刷出去，而刷的动作本身
     # 可能触发一次 HTTP 上报（Langfuse）——趁进程还在、连接池还没关的时候做
@@ -70,7 +72,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await dispose_rerank()
     # LLM 客户端持有 httpx 连接池，不关会在测试与热重载里累积成"连接未关闭"告警
     await dispose_llm()
-    logger.info("{} 已停机", settings.app.name)
+    logger.info("%s 已停机", settings.app.name)
 
 
 def create_app() -> FastAPI:

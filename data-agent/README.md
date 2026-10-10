@@ -856,6 +856,13 @@ filter 是 sink 级的，多一个 sink 就得记得多挂一个，漏挂的那�
 `uvicorn.protocols.http.h11_impl` 这类内部模块名，按 "uvicorn.access" 搜不到访问日志），
 以及按调用栈回溯算出真实的调用点（否则每行都写着 `logging:callHandlers:1762`）。
 
+**占位符要看用的是哪个 logger**：`logging.getLogger()` 走标准库语义，占位符必须是
+`%s`；写成 loguru 的 `{}` 不会在写的那一行报错，而是在 emit 时由 `msg % args` 抛出
+`TypeError: not all arguments converted`。阶段 11 往 `lifespan` 里加启动日志时就撞上了
+——那两行只在真正 `uvicorn` 启动时执行，pytest 从不经过 `lifespan`，所以测试全绿也
+照不出来，表现为"服务起不来"，堆栈却指向日志模块。转接器因此**刻意保留标准库的
+容错**：格式化失败只降级成一行可读的原文，不让一条写错的日志终止进程。
+
 客户端自带的 id 要过白名单 `[A-Za-z0-9._:-]{1,64}`：它会进日志行，带换行的值能把一条
 日志伪装成两条。不合规就换一个自己生成的——**不拒绝请求**，request_id 是排障线索，
 不是安全边界。

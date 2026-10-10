@@ -80,9 +80,20 @@ class InterceptHandler(logging.Handler):
             frame = frame.f_back
             depth += 1
 
+        # `record.getMessage()` 是 `msg % args`，参数对不上就抛 TypeError。
+        # 标准库自己的 `StreamHandler.emit` 把整个 format 包在 try 里，失败只打一行
+        # "--- Logging error ---" 就继续走——**一条日志写错绝不该让进程起不来**。
+        # 转接器必须保持这个性质：日志是旁路，不参与业务成败。
+        # 这里不这么兜的话，`logger.info("{} v{}", a, b)` 这种把 loguru 的 `{}` 写进
+        # 标准库调用的笔误，会在 emit 那一刻直接终止启动（阶段 12 启动时真撞上了）。
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = f"{record.msg!r}（日志参数有误，原文见上；args={record.args!r}）"
+
         logger.opt(depth=depth, exception=record.exc_info).patch(
             lambda patched: patched.update(name=record.name)
-        ).log(level, record.getMessage())
+        ).log(level, message)
 
 
 def _patch(record: dict[str, Any]) -> None:
