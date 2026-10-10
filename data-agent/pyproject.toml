@@ -44,13 +44,32 @@ dependencies = [
     # 不用 langgraph-checkpoint-redis——它硬依赖 RediSearch 与 RedisJSON 两个模块，
     # 而 Windows 版 Redis 的发行包不含任何模块（见 app/agent/redis_checkpointer.py）
     "redis[hiredis]>=5.0",
+    # 可观测性（阶段 11 / NFR-OBS）
+    # loguru：日志出口，并用 InterceptHandler 接管标准库 logging（见 app/core/log_setup.py）
+    "loguru>=0.7",
+    # opentelemetry-sdk：链路追踪的 provider / 处理器 / 内存导出器。
+    # 只装 sdk 与 exporter，不装 opentelemetry-instrumentation-fastapi——
+    # FastAPI 0.128 自带原生 telemetry，比那个 instrumentor 生成的 trace 更细
+    # （详见数据通达-技术设计文档.md 的可观测性一节）
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    # langfuse：把 span 收成可检索的 trace，并据此算 LLM 费用
+    "langfuse>=4.0",
 ]
 
 # 以下依赖按开发阶段逐步启用（见《开发步骤文档》），避免过早引入未使用的重依赖：
 #   阶段 6  混合检索    : 无需新增依赖——向量检索用 qdrant-client，全文检索用
 #                        elasticsearch，重排走 httpx（均为已有依赖）。
 #                        重排**服务**是独立进程，不装进本环境（ADR-005）
-#   阶段 11 可观测      : loguru, opentelemetry-sdk, opentelemetry-instrumentation-fastapi, langfuse
+#
+# 阶段 11（可观测）的三个依赖已列进上面的 dependencies，不在这里挂注释。
+# 特别说明**没有**引入 opentelemetry-instrumentation-fastapi：FastAPI 0.128 起
+# 自带原生 telemetry，而那个 instrumentor 一旦装上，原生 telemetry 会在检测到
+# 它的中间件时主动让路（见 fastapi/telemetry/_asgi.py 的 _legacy_otel），
+# 结果是 trace 反而变粗：语义约定退回旧的 http.target，丢掉
+# fastapi.dependencies / fastapi.endpoint / fastapi.serialization 几层 span，
+# 还平白多出两条 "GET /x http send"。三种组合都实测过，结论见 TDD 的可观测性一节。
+# 因此也不要用 FastAPIInstrumentor.instrument_app() ——它不报错，只是让 trace 变差。
 
 [project.optional-dependencies]
 # 开发/验收用：uv pip install -e ".[dev]"

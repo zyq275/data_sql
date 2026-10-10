@@ -122,6 +122,9 @@ data-agent/                        # 后端
 │   ├── schemas/                   # 请求/响应
 │   ├── services/                  # 服务层
 │   ├── core/                      # 配置/安全/异常/日志/响应（含 sql_security.py）
+│   │   ├── log_setup.py           # loguru 出口 + 接管标准库 logging（阶段 11）
+│   │   ├── request_context.py     # request_id 的 ContextVar 与请求头白名单（阶段 11）
+│   │   └── tracing.py             # OTel provider、节点/LLM 埋点、Langfuse（阶段 11）
 │   └── scripts/                   # 离线脚本
 ├── evals/                         # 评测集与评测脚本
 └── tests/                         # 单元测试
@@ -144,6 +147,8 @@ data-agent-frontend/               # 前端
 | agent.nodes.* | 单一职责节点 |
 | agent.events / rendering / parsing / prompts | 事件构造、上下文拼装、模型输出解析、提示词装载 |
 | core.sql_security | SQL 只读校验（白名单解析 + 关键词黑名单） |
+| core.request_context / log_setup | request_id 的生成与携带；日志出口与标准库 logging 的接管（阶段 11） |
+| core.tracing | 链路追踪：OTel provider、节点/LLM/汇总埋点、Langfuse 处理器与内容闸门（阶段 11） |
 | repositories.dw | 数仓只读执行与三重限制 |
 | retrievers.dense / fulltext | 单路检索（Qdrant 向量 / ES 全文） |
 | retrievers.fusion | RRF 融合（纯函数，无 IO） |
@@ -1010,14 +1015,75 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 
 | 需求 | 落地方式 |
 |---|---|
-| 请求追踪 | 中间件 uuid 注入 ContextVar，loguru patch |
-| 链路追踪 | OpenTelemetry 采集，Langfuse 追踪 LLM 调用 |
+| 请求追踪 | 中间件 uuid 注入 ContextVar，loguru patch（实现说明见 §10.1） |
+| 链路追踪 | OpenTelemetry 采集（含节点耗时与召回命中数），Langfuse 追踪 LLM 调用与 token（实现说明见 §10.1） |
 | 安全防护 | 见"安全设计" |
 | 健康探针 | /health 存活；/health/ready 逐项探测 MySQL(meta/dw)、Qdrant、ES、Embedding、Redis（阶段 7 起接入，真发一次 PING，报的是它自己 `enabled`/连接的那份配置而不是进程内的选型结果），任一不可用返 503。ES 一项只在三个索引齐备时算就绪，但缺索引不判 failed——它属于"没建库"而非"服务故障"，如实报"已建 N/3"更利于定位；Rerank 是可选依赖，不参与就绪判定 |
 | 优雅启停 | lifespan 中 init/close ClientManager |
 | 超时与重试 | LLM 超时+重试；SQL max_execution_time + 行数上限 |
-| 日志分级 | loguru 文件+控制台，rotation/retention 配置化 |
+| 日志分级 | loguru 统一出口（阶段 11 接管标准库 logging），级别由 `observability.log_level` 配置 |
 | 数据库迁移 | Alembic 管理 schema 演进 |
+
+> **日志目前只输出到 stderr，没有配文件 sink**（也没有 rotation/retention）：
+> 容器化部署下由运行时负责落盘与轮转，应用内再写一份文件只会产生两套互不同步的
+> 日志。需要文件时在这里补 `logger.add(...)`，别在业务代码里另起一个 sink。
+
+### 10.1 实现说明（阶段 11）
+
+**一条管线，不是两套埋点。** 服务端 span 由 FastAPI 0.128 的原生 telemetry 产生
+（`FastAPI(telemetry=telemetry_config(...))`），节点、LLM 调用、整轮汇总由
+`core.tracing` 自己埋，两者写同一个全局 provider。这一点是硬要求：各写一个 provider
+的话，Langfuse 上看到的是一个个孤立的节点，而"这次问答慢在哪"恰恰要顺着树看。
+
+**不用 `opentelemetry-instrumentation-fastapi`。** 实测三种组合后的结论：一旦挂上
+那个 instrumentor，FastAPI 的原生 telemetry 会主动让路
+（`fastapi/telemetry/_asgi.py::_legacy_otel` 直接翻中间件栈找
+`OpenTelemetryMiddleware`），trace 反而变粗——语义约定退回旧的 `http.target`，
+丢掉 `fastapi.dependencies` / `fastapi.endpoint` / `fastapi.serialization` 三层 span，
+还多出两条 `GET /x http send`。因此依赖也不声明它（见 `pyproject.toml` 的说明）。
+**`FastAPIInstrumentor.instrument_app()` 不要加**：它不报错，只是让 trace 变差。
+
+**数据出境这件事写进配置，不交给环境变量。** `telemetry_config` 里
+`auto_configure=False` 是必须的：它默认会在启动时读环境里的
+`OTEL_EXPORTER_OTLP_ENDPOINT` 并自行挂导出器，那等于"数据往哪儿发"由一个不在仓库
+里的变量决定（NFR-SEC-003 的同一条道理）。要发往通用 OTLP 后端就配
+`observability.otlp_endpoint`，那条路是我们自己接的。`metrics` / `logs` 同样关掉，
+只接 trace。`/health` 探针不进链路。
+
+**Langfuse 的两道坎，都是实测出来的。**
+
+1. 默认的导出过滤器（`langfuse.span_filter.is_default_export_span`）只放行 Langfuse
+   自己的 scope、带 `gen_ai*` 属性的、以及它认识的几个 instrumentation。我们的节点
+   span 一个都不沾，结果是**只有 LLM 调用上报**、每次调用自成一条 trace
+   （`isRootObservation: true`）。必须显式传 `should_export_span=`。
+2. 属性名决定它在界面上叫什么。实测（发一条只带普通属性的 span，再用
+   `fields=metadata` 读回来）：
+
+   | 写在 span 上 | Langfuse 那边落成 |
+   |---|---|
+   | `agent.recall.columns` | `attributes.agent.recall.columns`（兜底命名空间） |
+   | `langfuse.observation.metadata.agent.recall.columns` | `agent.recall.columns` |
+   | `langfuse.trace.metadata.agent.duration_ms` | `agent.duration_ms` |
+
+   `attributes.` 是"不认识的属性"的倾倒口，与 `http.route`、`resourceAttributes.*`
+   混在一起。所以命中数与整轮汇总各写两份：中性名给通用 OTLP 后端与测试断言，
+   Langfuse 认的名字给面板，两处由同一个函数产出。
+
+   另外，**`langfuse.trace.metadata.*` 只有在根 span 上写才算数**——实测同一棵树里
+   父/子 span 各写一个，读回来只剩父的那个，子 span 的静默丢弃。整轮汇总因此必须
+   落在服务端 span 上。
+
+**日志接管的两个细节**（`log_setup.InterceptHandler`）：转接标准库记录时要用
+`logger.patch` 把 `{name}` 换成标准库那边的 logger 名（否则 uvicorn 的私有 logger
+会被推成 `uvicorn.protocols.http.h11_impl` 这类内部模块名，按 "uvicorn.access" 搜不到
+访问日志），并按调用栈回溯算出真实调用点（否则每行都写着 `logging:callHandlers:1762`）。
+`diagnose` 必须关闭：它会把栈帧局部变量打进日志，而登录/改密的局部变量里有明文口令。
+
+**request_id 的边界**：客户端带的值要过白名单 `[A-Za-z0-9._:-]{1,64}` 才采用，
+其余换成自己生成的——它会进日志行，带换行的值能把一条日志伪装成两条。不合规
+**不拒绝请求**：request_id 是排障线索，不是安全边界。中间件是裸 ASGI 而非
+`BaseHTTPMiddleware`，后者会把响应包进额外的 anyio 任务，SSE 的边生成边推送会被
+缓冲成最后一次性吐出。
 
 ---
 
@@ -1038,6 +1104,11 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 | es.value_index / column_index / metric_index | data-agent-value / data-agent-column-text / data-agent-metric-text | YAML |
 | redis.enabled / host / port / db / password | true / 127.0.0.1 / 6379 / 0 | YAML / env（password） |
 | sql_security.max_execution_time_ms / max_result_rows | 30000 / 10000 | 配置 |
+| observability.enabled / log_level | true / INFO | YAML / env |
+| observability.otlp_endpoint | 空（只走 Langfuse） | YAML / env |
+| langfuse.enabled / host / timeout | true / https://cloud.langfuse.com / 5s | YAML / env |
+| langfuse.public_key / secret_key | — | env（密钥） |
+| langfuse.capture_content | false（只上报结构信息，不上报内容） | YAML / env |
 | cors_origins | 白名单 | env |
 
 > **embedding.host 指向服务的 OpenAI 兼容根路径**（以 `/v1` 结尾），即调用
@@ -1063,6 +1134,20 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 > 只写入 `.env`，与 LLM/数据库口令同级对待。仅 Redis 用作缓存时需要选 `db`，
 > 本阶段只用 0 号库，checkpointer 的键统一带 `prefix`（默认 `checkpoint`），
 > 不与将来可能的缓存用途混在一个命名空间里。
+>
+> **langfuse.capture_content**（阶段 11）：唯一一项管的不是"往哪儿发"而是
+> **"允不允许把内容发出去"**的配置。`false`（默认）只上报结构信息（节点名、模型名、
+> token 数、耗时、命中数），业务问题原文、生成的 SQL、查询结果不出本机；`true` 则
+> 提示词与模型输出原样上报。默认取保守的一侧，两个方向的纠错成本不对称：默认不传、
+> 需要时打开只是改一行配置；默认传了、事后才发现不该传，数据已经在第三方服务器上。
+> `public_key` / `secret_key` 只写入 `.env`，与数据库口令同级；缺 key 时不报错也不建
+> 客户端，本地没注册 Langfuse 照常跑。域名按区域区分（EU `cloud.langfuse.com`，
+> US `us.cloud.langfuse.com`），密钥只在所属区域有效，填错拿到的是 401。
+>
+> **observability.enabled**（阶段 11）：置 false 后进程里不再产生任何 span——
+> 连 FastAPI 的原生 telemetry 也一并关掉（见 §10.1），而不是"产生了但我们不看"。
+> `otlp_endpoint` 是不依赖 Langfuse 的那条路，填了就把 span 同时送到任意 OTLP 后端；
+> 用这一项而**不**用 `OTEL_EXPORTER_OTLP_ENDPOINT` 环境变量，理由见 §10.1。
 
 ---
 
@@ -1165,5 +1250,5 @@ make eval        # 运行评测
 | 8 | 可解释性与可视化：generate_explain + recommend_visualization 节点 | SQL 解释 + 图表推荐 |
 | 9 | 数据权限：权限模型 + SQL 生成上下文注入 | 权限治理 |
 | 10 | 评测体系与数据看板：评测集 + 批量评测 + eval_run 记录 + 看板接口 | 效果度量 |
-| 11 | 可观测：OTel + Langfuse + 指标 | 链路追踪 |
+| 11 | 可观测：request_id 贯穿日志、OTel 链路、Langfuse LLM 追踪、节点耗时与召回命中数 | 链路追踪（实现说明见 §10.1） |
 | 12 | 前端：设计系统 + 会话 UI + 可解释展示 + 个人设置 + 数据看板 + 评测看板 | 交互落地 |

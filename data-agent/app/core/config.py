@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -194,6 +194,51 @@ class SQLSecuritySettings(BaseModel):
     )
 
 
+class LangfuseSettings(BaseModel):
+    """Langfuse 追踪配置（阶段 11 / NFR-OBS）。
+
+    这一段与其他段最不同的一点是 ``capture_content``：它不是"往哪儿发"，
+    而是**"允不允许把内容发出去"**。
+
+    - ``False``（默认）：只有节点名、模型名、token 数、耗时、命中数这些**结构**
+      信息出境。业务问题原文、生成的 SQL、结果数据一个字节都不出本机。
+    - ``True``：提示词与模型输出原样上报，Langfuse 上能直接看到"问了什么、
+      答了什么"，排查效率高得多，代价是业务数据进了第三方 SaaS。
+
+    默认给了保守的一侧，是因为这两个方向的**纠错成本不对称**：默认不传、
+    需要时打开，只是下次改一个配置；默认传了、事后才发现不该传，数据已经在别人
+    的服务器上了，删不回来。所以开关叫 ``capture_content``（"允许抓内容"）
+    而不是 ``mask_content``——默认值必须等于"什么都不发"。
+    """
+
+    enabled: bool = True
+    public_key: str = ""
+    secret_key: str = ""
+    host: str = "https://cloud.langfuse.com"
+    """区域不同的域名不同：EU 是 cloud.langfuse.com，US 是 us.cloud.langfuse.com。
+    密钥只在它所属区域的域名下有效，填错了得到的是 401 而不是一个说得清的错误。"""
+    timeout: int = 5
+    capture_content: bool = False
+
+    @property
+    def configured(self) -> bool:
+        """是否可以真的建客户端。缺 key 就是没配——**不报错，只降级**。"""
+        return bool(self.enabled and self.public_key and self.secret_key)
+
+
+class ObservabilitySettings(BaseModel):
+    """可观测性总开关（阶段 11 / NFR-OBS）。
+
+    ``otlp_endpoint`` 是**不依赖 Langfuse** 的那条路：填了就把 span 同时送到
+    任意 OTLP 后端（自建 collector、Jaeger、Tempo……）。留空则只走 Langfuse；
+    两者都不用时把 ``enabled`` 关掉，进程里就不会再产生任何链路数据。
+    """
+
+    enabled: bool = True
+    log_level: str = "INFO"
+    otlp_endpoint: str = ""
+
+
 class Settings(BaseSettings):
     """全局配置根对象。"""
 
@@ -216,7 +261,47 @@ class Settings(BaseSettings):
     es: ElasticsearchSettings = ElasticsearchSettings()
     redis: RedisSettings = RedisSettings()
     sql_security: SQLSecuritySettings = SQLSecuritySettings()
+    observability: ObservabilitySettings = ObservabilitySettings()
+    langfuse: LangfuseSettings = LangfuseSettings()
     cors_origins: list[str] = Field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Langfuse 凭证的另一种拼法（见下）
+    #
+    # Langfuse 官方 SDK 读的环境变量是**单下划线**的（LANGFUSE_PUBLIC_KEY /
+    # LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL），与本项目 SECTION__FIELD 的双
+    # 下划线惯例不同。这里两个都认：AliasChoices 里每一项都是同一个东西的拼法。
+    #
+    # 为什么迁就 SDK 的拼法：这三个名字是 Langfuse 的事实标准——官方文档、
+    # 其余集成、CI 里现成的注入都长这样，为了整齐要求改名，收益只是好看；
+    # 而代价是每个人第一次配的时候都要去查一遍"这个项目里它叫什么"。
+    #
+    # 为什么它们必须声明在**顶层**：嵌套模型里的字段指向不了"不带前缀"的变量名。
+    # 实测给 langfuse.public_key 设 validation_alias 之后，连 LANGFUSE__PUBLIC_KEY
+    # 这种符合惯例的拼法也读不到了（pydantic-settings 的嵌套查找被别名整个替掉）。
+    # 声明在顶层之后，由下面的 validator 并回 langfuse 那一节，
+    # 业务代码因此只需认一个地方：settings.langfuse.*
+    # ------------------------------------------------------------------
+    langfuse_public_key: str = Field(
+        "", validation_alias=AliasChoices("LANGFUSE_PUBLIC_KEY", "LANGFUSE__PUBLIC_KEY")
+    )
+    langfuse_secret_key: str = Field(
+        "", validation_alias=AliasChoices("LANGFUSE_SECRET_KEY", "LANGFUSE__SECRET_KEY")
+    )
+    langfuse_base_url: str = Field(
+        "", validation_alias=AliasChoices("LANGFUSE_BASE_URL", "LANGFUSE_HOST", "LANGFUSE__HOST")
+    )
+
+    @model_validator(mode="after")
+    def _merge_langfuse_credentials(self) -> Settings:
+        """把上面三个平铺字段并进 ``langfuse`` 那一节（显式写的值优先）。"""
+        if self.langfuse_public_key:
+            self.langfuse.public_key = self.langfuse_public_key
+        if self.langfuse_secret_key:
+            self.langfuse.secret_key = self.langfuse_secret_key
+        if self.langfuse_base_url:
+            self.langfuse.host = self.langfuse_base_url
+        return self
 
     @classmethod
     def settings_customise_sources(

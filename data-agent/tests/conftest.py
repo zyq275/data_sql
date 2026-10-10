@@ -41,6 +41,16 @@ HAS_REAL_LLM = bool(_REAL_LLM_KEY and _REAL_LLM_KEY != LLM_KEY_PLACEHOLDER)
 if not HAS_REAL_LLM:
     os.environ["LLM__API_KEY"] = LLM_KEY_PLACEHOLDER
 
+# Langfuse（阶段 11）一律关掉，且**不用 setdefault**：.env 里的那对 key 指向的是
+# 真实账号，只要有一次测试请求产生了 span，Langfuse 那边就会多出一条真实 trace，
+# 记在用户账上。全量测试跑一遍会造出成百上千条这种噪音，把真正要看的那些淹掉，
+# 而事后只能一条条删——所以这里要盖过个人配置，而不是"没配才补"。
+#
+# 代价为零：节点耗时、召回命中数、request_id 那些断言读的都是 OTel 一侧，
+# 与 Langfuse 在不在无关；Langfuse 侧的接线另有 test_observability 里的
+# "一条管线"用例守着（用假 key，当场 shutdown，不产生任何 span）。
+os.environ["LANGFUSE__ENABLED"] = "false"
+
 TCP_PROBE_TIMEOUT_SECONDS = 1.0
 
 
@@ -104,6 +114,36 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "requires_stack" in item.keywords:
             item.add_marker(skip_marker)
+
+
+@pytest.fixture
+def otel_spans():
+    """把全局 TracerProvider 换成"导出到内存"的那一个，产出导出器。
+
+    ``reset_tracing`` 是必需的：``set_tracer_provider`` 只在进程里生效一次，
+    第二次调用会被静默忽略（只打一条 warning）。测试要在同一个进程里反复换
+    provider，只能先清掉 OTel 的私有字段（见 tracing.reset_tracing 的说明）。
+
+    放在 conftest 而不是某个测试模块里：阶段 11 的单元测试与验收测试都要用它，
+    而两处各写一份的话，迟早有一份忘了 reset，症状是"某些用例里 span 全空"——
+    那是最费时间的一类排查。
+    """
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from app.core.tracing import reset_tracing
+
+    reset_tracing()
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        reset_tracing()
 
 
 def rerank_available() -> bool:

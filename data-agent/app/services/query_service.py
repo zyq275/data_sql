@@ -33,11 +33,17 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.context import QueryContext
-from app.agent.events import DONE, ERROR, EXPLAIN, RESULT, SQL
+from app.agent.events import DONE, ERROR, EXPLAIN, RESULT, SQL, count_hits
 from app.agent.graph import get_graph
+from app.agent.llm import LLMUsage
 from app.agent.rendering import MAX_HISTORY_TURNS
 from app.agent.state import MAX_SQL_CORRECTIONS, QueryState, initial_state
 from app.core.exceptions import AppException, ServiceError
+from app.core.tracing import (
+    ATTR_TRACE_METADATA_PREFIX,
+    annotate_current_span,
+    recall_attributes,
+)
 from app.models import Conversation
 from app.repositories.conversation import ConversationRepository, MessageRepository
 from app.repositories.query_history import (
@@ -190,6 +196,8 @@ class QueryService:
         if failure is None and final.get("error"):
             failure = self._gave_up(final)
 
+        duration_ms = int((time.perf_counter() - started) * 1000)
+
         # 落库失败与"图跑挂"是两件事：前者不该变成后者那样的事件（用户已经看到答案了）
         await self._persist(
             user_id=user_id,
@@ -198,7 +206,17 @@ class QueryService:
             query=query,
             final=final,
             trace=trace,
-            duration_ms=int((time.perf_counter() - started) * 1000),
+            duration_ms=duration_ms,
+            ok=failure is None,
+        )
+
+        _report(
+            final=final,
+            # 用 getattr 而不是直接点出属性：LLM 是可插拔的（TDD 3），测试与将来的
+            # 实现完全可能换掉这一个依赖，而"换掉的网关没有 usage"绝不该让一次
+            # 已经跑完的问答炸在收尾处——那正是埋点带来的故障，不是它带来的价值。
+            usage=getattr(context.llm, "usage", None),
+            duration_ms=duration_ms,
             ok=failure is None,
         )
 
@@ -353,6 +371,88 @@ class _Trace:
         elif kind == EXPLAIN:
             text = event.get("text")
             self.explain = text if isinstance(text, str) and text else None
+
+
+def _report(
+    *,
+    final: QueryState,
+    usage: LLMUsage | None,
+    duration_ms: int,
+    ok: bool,
+) -> None:
+    """把这一轮的用量与命中数交出去：一条日志 + 一组 span 属性（阶段 11）。
+
+    **同一份数字去两个地方**，而不是各算各的：日志是"人看得见的"，span 是
+    "面板上能聚合的"，两者的口径必须一致——对不上时，看板与日志会各说各话，
+    而这类不一致最难发现，因为两边单独看都很合理。
+
+    **为什么在服务层记，而不是在各自的埋点里记**：这一行要的是"一整轮"的视图
+    （各环节命中多少、模型花掉多少 token、总共多久）。节点埋点只知道自己的那一段，
+    凑不出这个总数；而服务层手里正好有图终态与网关的用量累计。
+
+    失败的一轮**照样记**：失败请求的耗时与 token 同样是成本，而且恰恰是排查的对象；
+    只记成功的话，面板上的平均耗时永远是好消息。
+
+    ``usage`` 可以是 None（换成没有用量统计的 LLM 实现时）。此时**不写 token 属性、
+    也不按 0 记**，而是在日志里明说"未采集"：0 会被聚合成"这一轮不花 token"。
+    """
+    counts = count_hits(final)
+    attributes: dict[str, object] = {
+        "agent.duration_ms": duration_ms,
+        "agent.outcome": "ok" if ok else "failed",
+    }
+    if usage is None:
+        llm_text = "模型用量未采集"
+    else:
+        attributes.update(
+            {
+                "agent.llm.calls": usage.calls,
+                "agent.llm.input_tokens": usage.input_tokens,
+                "agent.llm.output_tokens": usage.output_tokens,
+            }
+        )
+        if usage.unknown_usage_calls:
+            attributes["agent.llm.unknown_usage_calls"] = usage.unknown_usage_calls
+        llm_text = (
+            f"模型调用 {usage.calls} 次（输入 {usage.input_tokens} / "
+            f"输出 {usage.output_tokens} tokens）"
+            + (f"，其中 {usage.unknown_usage_calls} 次未返回用量" if usage.unknown_usage_calls else "")
+        )
+    attributes.update(recall_attributes(counts))
+
+    # 整轮汇总再写一份 Langfuse 的 trace metadata：汇总恰好落在根 span
+    # （服务端 span）上，于是"这一轮烧了多少 token、总共多久"会成为整条 trace 的
+    # 元数据，能在 trace 列表上直接看见、直接按值筛。
+    #
+    # 与召回命中数同样的道理：不写这一份**不是看不见**（普通属性会被 Langfuse
+    # 收进 ``attributes.`` 杂物桶，实测），而是那一列会叫
+    # ``attributes.agent.duration_ms``——一个兜底命名的副产品，而不是一级元数据。
+    #
+    # 只镜像汇总本身，不镜像刚加进去的召回命中数：那些是**逐节点**的数，
+    # 已经在各自的节点 span 上了，再抄到 trace 上只是同一批数字的第三份副本。
+    trace_metadata = {
+        f"{ATTR_TRACE_METADATA_PREFIX}{key}": value
+        for key, value in attributes.items()
+        if not key.startswith("langfuse.")
+    }
+    attributes.update(trace_metadata)
+
+    annotate_current_span(attributes)
+
+    logger.info(
+        "本轮问答%s：用时 %dms，%s；命中 字段 %d、取值 %d、指标 %d，合并后 %d 条，"
+        "选中 表 %d、指标 %d，结果 %d 行",
+        "完成" if ok else "失败",
+        duration_ms,
+        llm_text,
+        counts.get("columns", 0),
+        counts.get("values", 0),
+        counts.get("metrics", 0),
+        counts.get("retrieved", 0),
+        counts.get("tables", 0),
+        counts.get("selected_metrics", 0),
+        counts.get("rows", 0),
+    )
 
 
 def _thread_config(session_id: str | None) -> dict | None:

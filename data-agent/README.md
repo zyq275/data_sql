@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 10 评测体系与数据看板**。
+当前进度：**阶段 11 可观测性**。
 
 ## 环境要求
 
@@ -17,6 +17,9 @@ Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说�
 - 阶段 6 可选：**Rerank 服务**（OpenAI 兼容的重排端点）。**没有也能跑**——
   检索降级为 RRF 融合顺序，每一步照常；此时请设 `RERANK__ENABLED=false`，
   否则每次查询都会打一条连不上的 WARNING
+- 阶段 11 可选：**Langfuse 账号**（追踪 LLM 调用与节点耗时）。**没有也能跑**——
+  request_id、节点耗时、召回命中数的埋点与日志都在应用内，span 只是没地方导出；
+  没配 key 时不报错，也不建客户端
 - Node ≥ 20（前端独立目录 `../data-agent-frontend`）
 
 ## 首次准备
@@ -119,7 +122,8 @@ uv pip install -e ".[dev]"            # 测试依赖
 跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
 那是真问题，测试必须失败，不会被跳过掩盖。
 
-跑阶段 5 / 阶段 7 / 阶段 8 / 阶段 9 / 阶段 10 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
+跑阶段 5 / 阶段 7 / 阶段 8 / 阶段 9 / 阶段 10 / 阶段 11 的端到端验收
+（需要完整服务栈 + 真实 LLM Key）：
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/test_stage5_acceptance.py -v -s
@@ -127,7 +131,12 @@ uv pip install -e ".[dev]"            # 测试依赖
 .venv/Scripts/python.exe -m pytest tests/test_stage8_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage9_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage10_acceptance.py -v -s
+.venv/Scripts/python.exe -m pytest tests/test_stage11_acceptance.py -v -s
 ```
+
+阶段 11 那组只跑**一次**真实问答（约 10 秒），三条验收标准共用它留下来的日志与
+span——跑三遍就是三次模型调用、三倍等待，而且三次之间的差异还会让人怀疑
+"是不是哪一次没埋上"。
 
 阶段 9 与阶段 10 那两组会往 `permission` 表里写配置，用例进出两头各做一次快照与还原
 （见 `test_permission_api.py` 的 `_isolate`）——角色只有三个固定取值，用不了
@@ -811,6 +820,134 @@ JOIN 条件由 `column_info` 的外键元数据推出来，不写死：数仓加
 | 数据看板接口仅 analyst 及以上可访问，viewer 返回 403，且只使用授权范围内表/字段 | `pytest tests/test_dashboard_api.py tests/test_stage10_acceptance.py -v`：viewer 两个端点都 403；只授 `fact_order` + `dim_date` 时，出数 SQL 里只出现这两张表（按 `referenced_tables` 判），按省份看数返回 403，维度下拉框里也没有未授权的维度。拼装规则（口径一致性、`None` 与 `""` 的区别、维度白名单、反引号别名、ORDER BY 用同一表达式）在 `tests/test_dashboard_sql.py` 里用纯函数逐条钉死，不碰数据库 |
 | 评测运行不污染线上数据 | 同上：跑一次评测前后，`conversation` / `message` / `query_history` 三张表的行数一行不差，发起人（admin）的会话数也不变。**这条只能这样验**——隔离做漏时评测照样跑通、指标照样好看，唯一不对的是用户在会话列表里看到自己没问过的问题，而那要等人打开页面才发现 |
 
+## 可观测性（阶段 11）
+
+| 文件 | 职责 |
+|---|---|
+| `core/request_context.py` | request_id 的上下文变量与请求头白名单（纯逻辑） |
+| `core/log_setup.py` | loguru 出口 + 接管标准库 logging；给每条记录补 request_id |
+| `core/tracing.py` | OTel provider、节点/LLM 埋点、Langfuse 处理器、内容闸门 |
+| `api/middleware.py` | request_id 与 CORS 两层中间件 |
+| `tests/test_observability.py` | 埋点自身的单元测试（不碰外部服务、不调模型） |
+| `tests/test_stage11_acceptance.py` | 三条验收标准，共用一次真实问答 |
+
+### request_id：一个值贯穿日志与链路
+
+中间件在入口生成（或采用客户端给的）id，写回 `X-Request-Id` 响应头、写进 contextvar，
+再由 loguru 的 **patcher** 补到每一条日志记录的 `extra` 上。用 patcher 而不是 filter：
+filter 是 sink 级的，多一个 sink 就得记得多挂一个，漏挂的那一个的日志就没有 id；
+补在记录上，任何 sink、任何格式串都能用。
+
+**这一层是裸 ASGI，不是 `BaseHTTPMiddleware`**：后者会把响应包进一个额外的 anyio
+任务，SSE 的边生成边推送会被缓冲成"最后一次性吐出"，进度事件全部同时到达。
+
+**标准库 logging 是接管而不是改写**：项目里一百多处 `logging.getLogger(__name__)`
+一个字没动就有了 id。代价是两处细节要自己兜——转接时用 `logger.patch` 把 `{name}`
+换成标准库那边的 logger 名（否则 uvicorn 的私有 logger 会被推成
+`uvicorn.protocols.http.h11_impl` 这类内部模块名，按 "uvicorn.access" 搜不到访问日志），
+以及按调用栈回溯算出真实的调用点（否则每行都写着 `logging:callHandlers:1762`）。
+
+客户端自带的 id 要过白名单 `[A-Za-z0-9._:-]{1,64}`：它会进日志行，带换行的值能把一条
+日志伪装成两条。不合规就换一个自己生成的——**不拒绝请求**，request_id 是排障线索，
+不是安全边界。
+
+### 一条管线：FastAPI 原生 telemetry + 节点埋点 → 同一个 provider
+
+服务端 span 由 **FastAPI 0.128 自带的原生 telemetry** 产生（配在
+`FastAPI(telemetry=telemetry_config(...))`），节点、LLM、召回命中数由 `tracing.py`
+自己埋；两者写同一个全局 provider，所以 Langfuse 上看到的是一棵树，而不是一堆
+各自成 trace 的孤立节点。
+
+**没有用 `opentelemetry-instrumentation-fastapi`**，这是实测后的取舍：那个
+instrumentor 一旦挂上，FastAPI 的原生 telemetry 会在检测到它的中间件时主动让路
+（`fastapi/telemetry/_asgi.py` 的 `_legacy_otel` 是直接翻中间件栈找
+`OpenTelemetryMiddleware` 的），trace 反而变粗——语义约定退回旧的 `http.target`，
+丢掉 `fastapi.dependencies` / `fastapi.endpoint` / `fastapi.serialization` 几层 span，
+还平白多出两条 `GET /x http send`。三种组合都跑过对比才定的。
+**别再加 `FastAPIInstrumentor.instrument_app()`**：它不会报错，只会让 trace 变差。
+
+`telemetry_config` 里有两处是**必须**关的，都指向同一件事——"数据往哪儿发"不能由
+运行环境里一个仓库外的变量决定（NFR-SEC-003 的同一条道理）：
+
+- `auto_configure=False`：它默认会在启动时读环境里的 `OTEL_EXPORTER_OTLP_ENDPOINT`
+  并自己挂一个导出器。要往通用 OTLP 后端发，用仓库里的
+  `observability.otlp_endpoint`，那条路是我们自己接的。
+- `metrics=False` / `logs=False`：只接 trace，不顺手把指标与日志也接上——没配
+  collector 时它们只会安静地攒在内存里。
+
+探针路径（`/health`）不进链路：健康检查每次都要打，混进来会让"请求数"这条线
+失去意义。
+
+### Langfuse：两个坑，都是实测出来的
+
+**一、默认的导出过滤器会把我们的 span 丢掉。** `langfuse.span_filter.is_default_export_span`
+只放行三类 span：Langfuse 自己 scope 的、带 `gen_ai*` 属性的、以及它认识的几个
+LLM instrumentation。我们的节点 span 一个都不沾，于是**只有 LLM 调用上了报**，
+每次调用自成一条 trace、`isRootObservation: true`——看上去"接上了"，实际是一地
+碎片。修法是给 `Langfuse(...)` 传 `should_export_span=`，把服务端 span 与带
+`agent.` / `langfuse.` / `request.` 前缀的 span 一并放行。
+
+**二、属性写什么名字，决定了它在界面上叫什么。** 实测（发一条只带普通属性的 span，
+再用 `fields=metadata` 读回来）：
+
+| 写在 span 上的 | Langfuse 那边落成 |
+|---|---|
+| `agent.recall.columns` | `attributes.agent.recall.columns`（"不认识的属性"杂物桶） |
+| `langfuse.observation.metadata.agent.recall.columns` | `agent.recall.columns`（一级元数据） |
+| `langfuse.trace.metadata.agent.duration_ms` | `agent.duration_ms`（一级 trace 元数据） |
+
+所以不是"普通属性看不见"——是它们会被归进 `attributes.` 这个和 `http.route`、
+`resourceAttributes.*` 混在一起的兜底命名空间。命中数与整轮汇总因此各写两份
+（中性名一份给通用 OTLP 后端与测试，Langfuse 认的名字一份给面板），两处都由
+同一个函数产出，不会只改了一边。
+
+**trace metadata 只有根 span 上写的才算数**：实测在同一棵树里让父 span 与子 span
+各写一个，读回来只剩父 span 那个，子 span 的静默丢弃。整轮汇总因此落在服务端 span
+（也就是根）上，`tests/test_stage11_acceptance.py` 里有一条断言专门钉这个位置。
+
+### 记录了什么
+
+| 埋点 | 落点 |
+|---|---|
+| 节点耗时 | 每个 Agent 节点一条 span，`agent.node.duration_ms`；Langfuse 侧还有它自己算的 `latency` |
+| 召回命中数 | 各节点的 `agent.recall.*`：字段/取值/指标三路召回、合并后条数、筛选后表与指标、结果行数 |
+| token 消耗 | 每次 LLM 调用一条 generation，带模型名与 `usage_details`（Langfuse 据此算费用） |
+| 整轮汇总 | 服务端 span 上一条：总耗时、成功/失败、调用次数与 token 合计 |
+
+失败的一轮**照样记**：失败请求的耗时与 token 同样是成本，而且恰恰是排查的对象；
+只记成功的话，面板上的平均耗时永远是好消息。模型没返回用量时**不写 token 属性、
+也不按 0 记**，而是在日志里明说"未采集"——0 会被聚合成"这一轮不花 token"。
+
+**内容默认不出境**：`langfuse.capture_content=false` 时，业务问题原文、生成的 SQL、
+查询结果一个字节都不上报，出去的只有结构信息。这个开关有两道闸——写入时就不写
+（内容连 exporter 的批次内存都进不去），导出前再按前缀抹一遍（防的是将来有人从
+别的路径写进去）。默认取保守的一侧，因为纠错成本不对称：默认不传、需要时打开只是
+改一行配置；默认传了、事后才发现不该传，数据已经在别人的服务器上，删不回来。
+
+## 验证清单（阶段 11 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 每次请求有 request_id 贯穿日志 | `pytest tests/test_stage11_acceptance.py -v`：响应头里的 id 与这一轮所有带 id 的日志是同一个，且条数 ≥ 5（入口打一条不算贯穿）；纯逻辑部分（白名单、上下文隔离、显式 bind 优先）在 `tests/test_observability.py` |
+| LLM 调用在 Langfuse 可追踪 | 同上：每次调用都是一条 generation，带模型名与用量，且长在这次请求的 span 树下（同 trace_id，祖先链上能找到服务端 span）。接线部分（处理器确实挂在我们这个 provider 上、没配 key 时不建客户端）在 `tests/test_observability.py`，用假 key 并当场 shutdown，不产生任何 span |
+| 节点耗时、token 消耗、召回命中数可统计 | 同上：每个节点都有耗时、七项召回指标一个不少、整轮汇总恰好一条。另有一条**反向**用例断言默认没有内容出境 |
+| 关掉总开关后什么都不产生 | `pytest tests/test_observability.py -k disabled -v`：`observability.enabled=false` 时连 FastAPI 的自动 span 都不产生 |
+
+验收跑的是**真链路**：真的 HTTP 入口、真的 Agent 图、真的 MySQL 与检索服务、
+真的大模型。桩能验"埋点代码写对了"，验不了"一次真实问答是不是真的留下了这些数据"
+——比如某个节点被跳过、某次调用走的是另一条分支，桩里都不会发生。
+
+**测试不往真实账号发数据**：`tests/conftest.py` 里把 `LANGFUSE__ENABLED` 强制设为
+`false`（**覆盖** `.env`，不是"没配才补"）。全量测试跑一遍会造出成百上千条 trace，
+记在用户账上，事后只能一条条删，把真正要看的那些淹掉。代价为零——节点耗时、命中数、
+request_id 的断言读的都是 OTel 一侧。Langfuse 那侧的接线另有 `test_observability`
+里那条"处理器挂在同一个 provider 上"的用例守着。
+
+真往账号里发一条的端到端检查是手工做的：`LANGFUSE__ENABLED=true` 跑一次问答，
+在 Langfuse 上核对树形结构与元数据。要用 API 读回来（新组织的 legacy 接口一律 410），
+走 `GET /api/public/v2/observations?fromStartTime=&toStartTime=`，
+**并且必须带 `fields=metadata,usage,metrics`**——默认只回 core+basic，看不到元数据与用量。
+
 ## 目录结构
 
 ```
@@ -837,7 +974,9 @@ data-agent/
 │   ├── models/                ORM 模型（阶段 2）
 │   ├── schemas/               请求/响应模型
 │   ├── services/              业务编排（含评测执行 eval_runner、看板取数 dashboard_service）
-│   ├── core/                  配置/安全/异常/日志/响应（含 sql_security.py）
+│   ├── core/                  配置/安全/异常/日志（log_setup）/请求上下文
+│   │                          （request_context）/响应/链路追踪（tracing，
+│   │                          含 sql_security.py）
 │   └── scripts/               离线脚本（init_admin、build_meta、seed_dw）
 ├── evals/                     预留目录（TDD 3 的规划）。阶段 10 的评测集存在
 │                              `eval_case` 表里、经接口增删，不需要文件形态的评测集，
