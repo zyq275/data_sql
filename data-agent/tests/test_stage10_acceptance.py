@@ -245,6 +245,17 @@ async def test_criterion_2_a_real_run_lands_all_four_metrics(
     问题都很直白，模型答不出结果的可能性很低。任何一个指标为空都说明那条链路
     （判分 / 召回判定 / 执行 / 计时）没接上——而看板上一个空值比一个难看的低分
     更难解释。
+
+    **样本特意选在维度表上，避开事实表**。事实表上的问题几乎都落在这套知识库的
+    指标口径里（订单量只算已支付），于是同一句"订单表里有多少条记录"，模型这次
+    按口径过滤、下次不过滤，准确率自己在 0.33 与 1.0 之间跳——而这里要验的是
+    "指标算得出来并落库"，不是一个会飘的成绩。维度表的行数是死数，模型怎么问都是
+    同一个答案，于是"判分链路是通的"这件事才判得出来。
+
+    第二条的判分依据是"与标准 SQL 的实际结果比对"：标准 SQL 的列名是数仓起的字面名
+    （``region_name`` / ``COUNT(dim_region.province)``），模型给的是自己起的别名
+    （大区 / 省份数）。**只断言"指标不是 None"是拦不住的**——按列名判等的那版实现下
+    accuracy 照样算得出来，只是算成了 0.0，而 0.0 看着像一个"系统答得不好"的结论。
     """
     async with _client() as client:
         created = await client.post(
@@ -252,17 +263,15 @@ async def test_criterion_2_a_real_run_lands_all_four_metrics(
             json={
                 "cases": [
                     {
-                        "query_text": "订单表里一共有多少条订单记录",
-                        "expected_sql": "SELECT COUNT(*) FROM fact_order",
-                        "expected_result": {"rows": [[3974]]},
+                        "query_text": "日期表里一共有多少天",
+                        "expected_sql": "SELECT COUNT(*) FROM dim_date",
+                        "expected_result": {"rows": [[1012]]},
                     },
                     {
-                        "query_text": "每个大区各有多少条订单",
+                        "query_text": "每个大区分别有多少个省份",
                         "expected_sql": (
-                            "SELECT dim_region.region_name, COUNT(*) "
-                            "FROM fact_order "
-                            "JOIN dim_region ON fact_order.region_id = dim_region.region_id "
-                            "GROUP BY dim_region.region_name"
+                            "SELECT dim_region.region_name, COUNT(dim_region.province) "
+                            "FROM dim_region GROUP BY dim_region.region_name"
                         ),
                     },
                 ]
@@ -282,6 +291,11 @@ async def test_criterion_2_a_real_run_lands_all_four_metrics(
 
     for field in ("accuracy", "recall_hit_rate", "execute_success_rate", "avg_duration_ms"):
         assert detail[field] is not None, f"{field} 没有算出来"
+
+    assert [o["correct"] for o in detail["outcomes"]] == [True, True], [
+        o["reason"] for o in detail["outcomes"]
+    ]
+    assert float(detail["accuracy"]) == 1.0
 
     # 指标不是接口现场算的：库里的那一行必须也是同一组数
     async with session_scope() as session:

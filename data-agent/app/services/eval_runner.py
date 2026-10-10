@@ -16,6 +16,11 @@ conversation / message / query_history / Redis 线程四样都不可能被写。
 无数种写法（别名、JOIN 顺序、括号），文本不同不等于结果不同，用文本判会把
 正确答案判成错的，而准确率是给人看的结论，宁可口径保守也不要它虚低。
 
+**同一个道理对列名也成立**，这一点是实测踩出来的：标准 SQL 写 ``COUNT(*)``，数仓
+给出的列名就是字面的 ``COUNT(*)``，而模型写 ``... AS 订单量`` 得到的列名是 ``订单量``，
+两边算出来的是同一张表。所以比对时**列名只用来对齐、不用来判等**（见 ``rows_equal``）：
+名字对得上就按名字对齐，对不上而列数相同就按位置比。列别名是写法，列数与取值才是答案。
+
 **召回命中率**：以标准 SQL 用到的表为准，看它们有没有全部进入"生成 SQL 时看得到
 的那份表清单"。它回答的是知识库维护者最关心的那个问题——这道题需要的表，召回
 与筛选有没有把它漏掉。
@@ -130,9 +135,19 @@ def _normalize_row(row: Sequence[object]) -> tuple:
 def rows_equal(actual: dict | None, expected: dict | None) -> tuple[bool, str]:
     """结果集比对（顺序无关的多重集比较）。返回 (是否一致, 说明)。
 
-    按列名对齐再比：同一份结果换个列顺序（``SELECT province, SUM(...)`` 与
-    ``SELECT SUM(...), province``）在业务上是同一个答案，不该被判错。
-    列名集合不一致时直接判不等——那种情况再怎么对齐也不是同一份结果。
+    **列名只用来对齐，不用来判等。** 列别名是写法而不是答案的一部分，而且模型
+    无从知道标准 SQL 会取什么列名：标准 SQL 写 ``COUNT(*)``，数仓给出的列名就是
+    字面的 ``COUNT(*)``，而模型写 ``COUNT(DISTINCT order_id) AS 订单量`` 得到的列名
+    是 ``订单量``。两边算出来的是同一张表，按列名判等会把这份正确答案判成错的——
+    这与"不比 SQL 文本"是同一个道理，只是往下一层：文本、别名都是表达，结果才是答案。
+
+    于是分三种情况：
+
+    - 两边的列名集合对得上 → 按列名对齐（同一份结果换个列顺序是同一个答案）；
+    - 对不上但列数相同 → **按列位置比对**，并在说明里写明这是退化比对；
+    - 列数都不同 → 判不等（那确实是两份不同的结果）。
+
+    行序无关，同理：``ORDER BY`` 本来就不保证跨索引、跨机器返回同一次序。
     """
     if actual is None:
         return False, "本次没有产生结果集，无法比对"
@@ -142,22 +157,36 @@ def rows_equal(actual: dict | None, expected: dict | None) -> tuple[bool, str]:
     actual_rows = list(actual.get("rows") or [])
     actual_columns = [str(name) for name in (actual.get("columns") or [])]
     expected_columns = [str(name) for name in (expected.get("columns") or [])]
+    expected_rows = list(expected.get("rows") or [])
 
+    aligned_by_name = False
     if expected_columns:
-        if sorted(actual_columns) != sorted(expected_columns):
+        if sorted(actual_columns) == sorted(expected_columns):
+            order = [actual_columns.index(name) for name in expected_columns]
+            actual_rows = [[row[index] for index in order] for row in actual_rows]
+            aligned_by_name = True
+        elif len(actual_columns) != len(expected_columns):
             return False, (
-                f"结果列不一致：实际 {actual_columns or '无'}，预期 {expected_columns}"
+                f"结果列数不一致：实际 {len(actual_columns)} 列 {actual_columns or '无'}，"
+                f"预期 {len(expected_columns)} 列 {expected_columns}"
             )
-        order = [actual_columns.index(name) for name in expected_columns]
-        actual_rows = [[row[index] for index in order] for row in actual_rows]
 
     # Counter 而不是排序后逐个比：行里混着 None 与数字，排序在类型不可比时直接抛错，
     # 而 Counter 只要求元素可哈希——元组正好满足，且天然就是"多重集相等"的语义
     left = Counter(_normalize_row(row) for row in actual_rows)
-    right = Counter(_normalize_row(row) for row in (expected.get("rows") or []))
+    right = Counter(_normalize_row(row) for row in expected_rows)
     if left == right:
-        return True, f"结果集一致（{len(actual_rows)} 行）"
-    return False, f"结果集不一致：实际 {len(actual_rows)} 行，预期 {len(expected.get('rows') or [])} 行"
+        note = "按列名对齐" if aligned_by_name else "按列位置比对"
+        return True, f"结果集一致（{len(actual_rows)} 行，{note}）"
+
+    reason = f"结果集不一致：实际 {len(actual_rows)} 行，预期 {len(expected_rows)} 行"
+    if expected_columns and not aligned_by_name:
+        # 退化比对这件事要说出来：不然看板上的人会以为"列名不一样所以判错"
+        reason += (
+            f"；两边列名不同（实际 {actual_columns}，预期 {expected_columns}），"
+            "已改按列位置比对"
+        )
+    return False, reason
 
 
 async def judge(

@@ -105,23 +105,54 @@ def test_rows_are_compared_as_a_multiset_not_a_sequence() -> None:
 
 
 def test_a_different_column_order_is_aligned_by_name_before_comparing() -> None:
-    """``SELECT province, SUM(..)`` 与 ``SELECT SUM(..), province`` 是同一个答案。"""
-    ok, _ = rows_equal(
+    """``SELECT province, SUM(..)`` 与 ``SELECT SUM(..), province`` 是同一个答案。
+
+    名字对得上时按名字对齐，而不是图省事退化成按位置比——两者在这里结论不同，
+    按位置比会把这份正确答案判错（100 与 "浙江" 对不上，而名字都在，没有理由不比名字）。
+    """
+    ok, why = rows_equal(
         {"columns": ["province", "gmv"], "rows": [["浙江", 100]]},
         {"columns": ["gmv", "province"], "rows": [[100, "浙江"]]},
     )
 
     assert ok is True
+    assert "按列名对齐" in why
 
 
-def test_a_different_set_of_columns_is_not_the_same_result() -> None:
+def test_a_different_column_alias_is_still_the_same_answer() -> None:
+    """列别名是写法，不是答案的一部分。
+
+    实测踩到过：标准 SQL 写 ``COUNT(*)``，数仓给出的列名就是字面的 ``COUNT(*)``；
+    而模型写 ``... AS 订单量`` 得到的列名是 ``订单量``。同一张表，按列名判等会判错——
+    这与"不比 SQL 文本"是同一个道理，只是往下一层。
+    """
+    ok, why = rows_equal(
+        {"columns": ["大区", "订单量"], "rows": [["华东", 100], ["华南", 200]]},
+        {"columns": ["region_name", "COUNT(*)"], "rows": [["华东", 100], ["华南", 200]]},
+    )
+
+    assert ok is True
+    assert "按列位置比对" in why, "退化比对这件事要写在说明里"
+
+
+def test_a_different_number_of_columns_is_not_the_same_result() -> None:
     ok, why = rows_equal(
         {"columns": ["province"], "rows": [["浙江"]]},
-        {"columns": ["region_name"], "rows": [["华东"]]},
+        {"columns": ["region_name", "country"], "rows": [["华东", "中国"]]},
     )
 
     assert ok is False
-    assert "列不一致" in why
+    assert "列数不一致" in why
+
+
+def test_a_wrong_value_still_fails_under_alias_comparison() -> None:
+    """按列位置比不等于放水：值不对还是要判错。"""
+    ok, _ = rows_equal(
+        {"columns": ["大区", "订单量"], "rows": [["华东", 100]]},
+        {"columns": ["region_name", "COUNT(*)"], "rows": [["华南", 100]]},
+    )
+
+    assert ok is False
 
 
 def test_float_noise_does_not_make_a_correct_answer_look_wrong() -> None:
