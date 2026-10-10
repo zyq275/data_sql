@@ -28,8 +28,18 @@ async def filter_metric(state: QueryState, runtime: Runtime[QueryContext]) -> di
     而不是召回结果里那份摘要：召回带的是 Qdrant payload，够用来"选"，
     但生成 SQL 需要的是"仅统计已支付订单"这种**过滤口径**——少了它，
     销售额会把已取消、已退款的订单一起算进去，数字看着合理却是错的。
+
+    **指标也要过权限**（阶段 9）：指标口径里写着 ``SUM(order_amount)`` 这类表达式，
+    它本身就是"用哪些字段"的说明书——一个碰了越权字段的指标，即便用户没问它，
+    仅仅出现在提示词里就等于把那个字段名告诉模型了。筛选前先裁一次候选，
+    取回口径后再收一次口（见下）。
     """
     candidates = [c for c in (state.get("retrieved") or []) if c.kind == "metric"]
+    if not candidates:
+        return {"metric_infos": []}
+
+    scope = await runtime.context.permissions.scope_for(runtime.context.role)
+    candidates = [c for c in candidates if scope.allows_metric(c.name)]
     if not candidates:
         return {"metric_infos": []}
 
@@ -48,7 +58,11 @@ async def filter_metric(state: QueryState, runtime: Runtime[QueryContext]) -> di
         picked = names
 
     valid = [name for name in dict.fromkeys(picked) if name in known]
-    return {"metric_infos": await runtime.context.knowledge.metrics(valid)}
+    metrics = await runtime.context.knowledge.metrics(valid)
+    # 收口：``known`` 已经取自过滤后的候选，这一步理论上不会再裁掉什么。
+    # 仍然写出来，是因为"未授权的东西一个都不进提示词"这条保证不该依赖
+    # 上游某个变量的取值链路——将来谁改了上面几行，这里还能兜住。
+    return {"metric_infos": [m for m in metrics if scope.allows_metric(m.name)]}
 
 
 async def _select(

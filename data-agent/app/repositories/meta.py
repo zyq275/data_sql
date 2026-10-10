@@ -56,6 +56,21 @@ class MetaRepository:
             chunk = rows[start:start + BATCH_SIZE]
             await self.session.execute(insert(model), list(chunk))
 
+    async def tables(self) -> Sequence[TableInfo]:
+        """全部表定义（按 id 排序，保证两次调用顺序一致）。
+
+        供阶段 9 的权限接口用：它要回答"这些 id 里哪些真的存在"，还要把 id 翻成
+        名字给人看。一次性取全表而不是逐条 ``get``——知识库的规模是"几十张表、
+        几百个字段"，全取比来回查便宜，也让"id → 名字"的映射只建一次。
+        """
+        result = await self.session.execute(select(TableInfo).order_by(TableInfo.id))
+        return result.scalars().all()
+
+    async def columns(self) -> Sequence[ColumnInfo]:
+        """全部字段定义（按 id 排序）。"""
+        result = await self.session.execute(select(ColumnInfo).order_by(ColumnInfo.id))
+        return result.scalars().all()
+
     async def counts(self) -> dict[str, int]:
         """各表行数，用于构建后的入库自检。"""
         out: dict[str, int] = {}

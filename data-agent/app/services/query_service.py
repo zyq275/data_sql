@@ -123,17 +123,21 @@ class QueryService:
         )
 
     async def stream(
-        self, query: str, *, user_id: str, turn: TurnContext
+        self, query: str, *, user_id: str, role: str = "viewer", turn: TurnContext
     ) -> AsyncIterator[dict]:
         """跑一遍图，逐个产出事件字典（SSE 帧的编码交给接口层）。
 
         产出的是**裸事件字典**而不是拼好的 SSE 文本：SSE 是传输细节，
         让它沉在服务层会让这一层没法被别的调用方（评测脚本、阶段 10 看板）复用。
+
+        ``role`` 用于算数据权限（阶段 9）。默认值只服务于单测与评测干跑，
+        真实入口（api/v1/query）显式传 ``user.role``——权限是安全边界，
+        不该依赖一个"忘了传也不会报错"的默认值。
         """
         started = time.perf_counter()
         session_id = turn.conversation.id if turn.conversation else None
         state = initial_state(query, session_id=session_id, history=turn.history)
-        context = QueryContext(user_id=user_id)
+        context = QueryContext(user_id=user_id, role=role)
         final: QueryState = state
         trace = _Trace()
         failure: dict | None = None

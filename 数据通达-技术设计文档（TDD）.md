@@ -112,6 +112,7 @@ data-agent/                        # 后端
 │   │   ├── knowledge.py           # 表/字段/指标口径获取
 │   │   ├── rendering.py           # 上下文拼装（表结构/指标/日期/库环境/结果摘要）
 │   │   ├── visualization.py       # 图表类型推荐规则（纯函数，阶段 8）
+│   │   ├── permissions.py         # 数据权限：范围计算与裁剪（阶段 9）
 │   │   └── nodes/*.py             # 各节点
 │   ├── retrievers/                # 检索层：dense/fulltext/fusion/candidate + retrieval 网关
 │   ├── clients/                   # 连接管理器
@@ -256,6 +257,24 @@ recall_column        recall_value                  recall_metric
 > - `message.explain_text` 与 `query_history.explain_text` 自此真实写入，阶段 7 的
 >   NULL 占位到此关闭。`chart_type` **不落库**：阶段 2 的 DDL 里没有对应列，而它完全
 >   由结果结构决定，凭同一份 `result_preview` 可重算——存一份只会与结果脱节。
+>
+> **阶段 9 的实现范围**：不新增节点，数据权限**注入已有的四个点**——`filter_table`
+> 与 `filter_metric` 在候选集进提示词之前按角色裁剪，`add_extra_context` 丢掉
+> 引用了已无权限对象的历史轮次，`validate_sql` 在只读校验之后、EXPLAIN 之前做兜底
+> 校验。前三个点让模型根本看不到未授权的名字，第四个点拦住"模型自己编的表名"与
+> "从历史里带进来的旧表名"，缺一不可。
+>
+> 判定核心（`agent/permissions.py` 的 `build_scope`）是**纯函数**，入参是简单元组，
+> 因此"谁看得到哪张表的哪一列"能在不连库的机器上逐条验；网关
+> `PermissionGateway` 只负责读库与把 ORM 行摊平成元组。范围在**实例内**按角色缓存，
+> 而一个 `QueryContext` 对应一轮问答，所以缓存生命周期正好是这一轮：同一轮里三处
+> 调用必须看到同一个范围（否则会出现"表被拦了、校验却放行"的中间态），而**跨请求
+> 不缓存**，于是没有"改完配置要清缓存"这一步。
+>
+> 前一个阶段沉淀的两条纪律在这里继续用：`role` 由接口层从 `user.role` 显式传下来
+> （`QueryService.stream` 的默认值只服务单测与评测干跑），权限作为安全边界不依赖
+> "忘了传也不会报错"的默认值；越权被拒时复用 **40203**，让既有的 correct_sql
+> 回边照常重写——model 手里有**裁剪过的**表结构，照着重写即可。
 
 ### 5.2 混合检索流程
 
@@ -519,7 +538,12 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
 | POST | /api/v1/admin/users | admin | 创建用户 |
 | PUT | /api/v1/admin/users/{id}/role | admin | 改角色 |
 | PUT | /api/v1/admin/users/{id}/status | admin | 启停 |
-| GET/POST/PUT/DELETE | /api/v1/permissions/* | admin | 数据权限 |
+| GET | /api/v1/permissions | admin | 权限映射列表（role 可筛选） |
+| POST | /api/v1/permissions | admin | 新增一条角色-资源映射 |
+| PUT | /api/v1/permissions/{id} | admin | 整条替换（三个字段都必填） |
+| DELETE | /api/v1/permissions/{id} | admin | 删除一条映射 |
+| GET | /api/v1/permissions/resources | admin | 可授权的表/字段清单（id ↔ 名字对照，供配置界面渲染勾选项） |
+| GET | /api/v1/permissions/roles/{role}/scope | admin | 该角色**实际生效**的可见范围 |
 | GET | /api/v1/eval/cases | admin | 评测集列表 |
 | POST | /api/v1/eval/cases | admin | 批量导入评测样本 |
 | DELETE | /api/v1/eval/cases/{id} | admin | 删除评测样本 |
@@ -530,6 +554,13 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
 | GET | /api/v1/dashboard/dimensions | analyst | 数据看板可用维度 |
 | GET | /health | 无 | 存活 |
 | GET | /health/ready | 无 | 就绪 |
+
+> 权限组的最后两个端点（阶段 9 补）回答的是两个不同的问题：
+> `/permissions/resources` 给出 `resource_id` 与表名/字段名的对照——id 是 uuid5，
+> 人认不出来，配置界面没有它就画不出勾选框；`/permissions/roles/{role}/scope`
+> 回答"**算出来是什么**"，与列表接口的"配了什么"不是一回事。两者在三种情况下不一致：
+> 该角色一条都没配（于是不设限）、配的字段已被知识库重建删掉（于是那条权限悬空）、
+> 以及字段级授权把整表收窄了。管理界面同时显示两者才对得上账。
 
 ### 7.3 SSE 事件协议
 
@@ -705,6 +736,19 @@ CREATE TABLE permission (
   INDEX idx_role (role)
 );
 ```
+
+> 阶段 9 落地时的三条口径：
+>
+> - **没有唯一约束**（阶段 2 定稿时如此），(role, resource_type, resource_id) 的判重在
+>   服务层做，重复创建返回 400 而不是静默成功——静默成功会让"配了两次"与"配了一次"
+>   看起来一样，而界面上的勾选状态是从这份数据反推的。
+> - `resource_type` 取 `table` / `column`，`resource_id` 指向 `table_info.id` /
+>   `column_info.id`（uuid5，由自然键确定）。指向不存在的资源返回 400：配一条永远
+>   不生效的权限比报错危险得多，界面上它会显示成"已授权"。
+> - **该角色一条记录都没有 = 不设限**。这是全新环境的默认语义，也是一处必须明写的
+>   约定：按白名单严格解读的话，刚部署完、还没人配过权限时所有角色都取不到任何一张表。
+>   一旦有了哪怕一条记录就按白名单严格执行，所以"开始配置"本身就是开关；
+>   反过来，删掉某角色最后一条配置等于把它退回不设限。
 
 **eval_case**
 
@@ -1005,7 +1049,7 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 | 40200 | QueryError | 400 | 问题本身不可用：为空、超长、召回不到任何数据表 |
 | 40201 | SQLGenerationError | 500 | 模型答复了但不是能用的 SQL；也用于 EXPLAIN 预检未通过 |
 | 40202 | SQLExecutionError | 500 | 预检通过但真正执行时报错（缺表、类型不符） |
-| 40203 | SQLSecurityError | 403 | 未通过只读安全校验（BR-SQL-001） |
+| 40203 | SQLSecurityError | 403 | 未通过只读安全校验（BR-SQL-001）；阶段 9 起也用于「SQL 引用了当前角色未授权的表或字段」（BR-PERM-001） |
 | 40204 | QueryTimeoutError | 504 | 超过 max_execution_time_ms（BR-SQL-003） |
 
 > 40201 与 50001 的分工：前者是「模型答了，但答的不是我们能用的」（空串、纯解释文字），
@@ -1026,7 +1070,7 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 |---|---|
 | SQL 注入 | sqlparse 白名单解析 + 只读账号 + 前缀/关键词校验 |
 | 越权访问 | JWT 鉴权 + 角色依赖 + 资源归属校验（user_id 过滤） |
-| 数据越权 | 表/字段级权限注入 SQL 生成上下文 |
+| 数据越权 | 表/字段级权限注入 SQL 生成上下文（前置裁剪 + validate_sql 兜底校验；被拒时不向用户透露具体表名/字段名，名字只进日志） |
 | 凭据泄露 | bcrypt 哈希、敏感配置环境变量注入、密钥不进代码库 |
 | Prompt 注入 | 提示词约束"仅使用提供的表/字段"，隔离用户输入 |
 | 令牌滥用 | 访问/刷新令牌分离、短期过期、类型校验 |

@@ -144,6 +144,99 @@ def assert_readonly(sql: str) -> str:
     return cleaned
 
 
+def _bare(value: str) -> str:
+    """把 token 原文整理成一个裸标识符。
+
+    去反引号（``\\`order_amount\\``）、去库名前缀（``dw.fact_order`` → ``fact_order``）：
+    调用方拿它去和元数据里的表名/字段名比对，而元数据存的是不带引号、不带库名的名字。
+    """
+    name = value.strip().strip("`")
+    if "." in name:
+        name = name.rsplit(".", 1)[-1].strip().strip("`")
+    return name
+
+
+def _significant(sql: str) -> list:
+    """解析出第一条有内容的语句的 token，并剥掉空白与注释。"""
+    statements = [s for s in sqlparse.parse(strip_code_fence(sql)) if _has_content(s)]
+    if not statements:
+        return []
+    return [
+        token
+        for token in statements[0].flatten()
+        if not token.is_whitespace and token.ttype not in T.Comment
+    ]
+
+
+def referenced_tables(sql: str) -> set[str]:
+    """从 FROM / JOIN 子句里提取被引用的表名（阶段 9 的权限兜底校验用）。
+
+    **它不负责也不试图判断这些名字是不是真表**：调用方拿到的名字去和**元数据里
+    已知的表名**求交集，交集之外的（CTE 名、派生表别名、写错的表名）自然被忽略。
+    这样就不必去区分 ``WITH x AS (...) SELECT * FROM x`` 里的 ``x``——它不是
+    元数据里的表，压根不会被当成越权。按"已知表名"来判，比按"语法上是不是表"
+    来判简单得多，也少了一大类误判。
+
+    ``FROM a, b`` 的逗号列表、``AS`` 别名、``LEFT OUTER JOIN`` 的多词关键字
+    都要处理：漏掉其中任何一个，都会让"这条 SQL 引用了什么"低估，而漏掉的正是
+    越权表时，兜底校验就形同虚设。
+    """
+    tokens = _significant(sql)
+    found: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        upper = token.value.upper() if token.ttype in T.Keyword else ""
+        if token.ttype in T.Keyword and (upper == "FROM" or upper.endswith("JOIN")):
+            index += 1
+            while index < len(tokens):
+                nxt = tokens[index]
+                if nxt.ttype in T.Punctuation and nxt.value == ",":
+                    index += 1
+                    continue
+                if nxt.ttype in T.Punctuation and nxt.value == "(":
+                    # 派生表：FROM (SELECT ...) t。括号里的表由它自己的 FROM 收走
+                    break
+                if nxt.ttype in T.Name or nxt.ttype is None:
+                    # 库名限定 ``dw.fact_order`` 会被切成 ``dw`` ``.`` ``fact_order``
+                    # 三个 token，取到家的是最后一段
+                    parts = [_bare(nxt.value)]
+                    index += 1
+                    while (
+                        index + 1 < len(tokens)
+                        and tokens[index].ttype in T.Punctuation
+                        and tokens[index].value == "."
+                        and (tokens[index + 1].ttype in T.Name or tokens[index + 1].ttype is None)
+                    ):
+                        parts.append(_bare(tokens[index + 1].value))
+                        index += 2
+                    found.add(parts[-1])
+                    # 吃掉 ``AS x`` 与 ``t x`` 两种别名写法，否则别名会被当成下一张表
+                    if index < len(tokens) and tokens[index].value.upper() == "AS":
+                        index += 1
+                    if index < len(tokens) and (tokens[index].ttype in T.Name or tokens[index].ttype is None):
+                        index += 1
+                    continue
+                break
+            continue
+        index += 1
+    return found
+
+
+def referenced_names(sql: str) -> set[str]:
+    """提取 SQL 里出现的全部标识符（表名、字段名、别名、函数名一视同仁）。
+
+    供阶段 9 的字段级兜底校验使用。同样不区分"这是字段还是别名"——调用方只拿它
+    与"已知但未授权的字段名"求交集。别名或函数名恰好撞上某个未授权字段名时会误判，
+    但那要两个名字一模一样才可能，且代价只是一次重写重试，比漏放一个未授权字段小得多。
+    """
+    return {
+        _bare(token.value)
+        for token in _significant(sql)
+        if token.ttype in T.Name or token.ttype is None
+    }
+
+
 def build_explain(sql: str) -> str | None:
     """把只读语句包成 EXPLAIN 供执行前预检（FR-QA-007）；不可预检时返回 None。
 

@@ -65,7 +65,7 @@ async def query(payload: QueryRequest, session: SessionDep, user: AuthUser) -> S
     """
     service = QueryService(session)
     turn = await service.prepare(user.id, payload.session_id)
-    events = service.stream(payload.query, user_id=user.id, turn=turn)
+    events = service.stream(payload.query, user_id=user.id, role=user.role, turn=turn)
     return StreamingResponse(
         _encode(events),
         media_type=SSE_MEDIA_TYPE,

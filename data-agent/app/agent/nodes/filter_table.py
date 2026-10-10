@@ -31,12 +31,24 @@ async def filter_table(state: QueryState, runtime: Runtime[QueryContext]) -> dic
 
     给出的是每张表的**完整**字段清单（见 knowledge.tables_for_columns），
     而不是只给召回命中的那几个——SQL 要分组、过滤、关联的字段未必在召回结果里。
+
+    **数据权限在这一步收口**（阶段 9），而且要收两次：进模型之前裁一次，
+    让它根本看不到未授权的表名与字段名；模型筛完再裁一次，因为 ``_trim``
+    会无条件把主外键加回来，而"没授权的主外键也不给"是权限的口径
+    （见 ``agent.permissions.PermissionScope.filter_tables``）。
     """
     candidates = state.get("retrieved") or []
     column_ids = [c.id for c in candidates if c.kind in ("column", "value")]
     tables = await runtime.context.knowledge.tables_for_columns(column_ids)
     if not tables:
         raise QueryError("没有召回到任何数据表，无法回答该问题")
+
+    scope = await runtime.context.permissions.scope_for(runtime.context.role)
+    tables = scope.filter_tables(tables)
+    if not tables:
+        # 召回有结果，但一条都不在授权范围内。这与"召回到不"是两回事，
+        # 报错要能让人分辨——用户看到"没召回到表"会去改问题问法，其实是权限。
+        raise QueryError("本次召回的数据表都不在当前角色的授权范围内")
 
     selected = await _select(runtime.context.llm, state["resolved_query"], tables)
     if selected is None:
@@ -46,7 +58,7 @@ async def filter_table(state: QueryState, runtime: Runtime[QueryContext]) -> dic
         # 模型明确判定"候选中没有能回答这个问题的表"。此时**绝不能放行空上下文**：
         # 模型拿不到任何表名，就会开始编造。一句明确的报错远比一段幻觉 SQL 有价值。
         raise QueryError("知识库的候选表里没有能回答该问题所需的表")
-    return {"table_infos": selected}
+    return {"table_infos": scope.filter_tables(selected)}
 
 
 async def _select(

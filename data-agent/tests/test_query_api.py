@@ -124,7 +124,9 @@ class StubService:
             raise NotFoundError("会话不存在")
         return None
 
-    async def stream(self, query: str, *, user_id: str, turn=None) -> AsyncIterator[dict]:
+    async def stream(
+        self, query: str, *, user_id: str, role: str = "viewer", turn=None
+    ) -> AsyncIterator[dict]:
         for event in self.SCRIPT:
             yield event
 
@@ -160,6 +162,31 @@ async def test_chinese_is_not_escaped_into_codepoints(monkeypatch) -> None:
 
     assert "上海市" in resp.text
     assert "\\u4e0a" not in resp.text
+
+
+async def test_the_current_users_role_is_handed_to_the_service(monkeypatch) -> None:
+    """当前用户的角色要一路传到服务层——阶段 9 的数据权限按它算。
+
+    ``QueryService.stream`` 的 ``role`` 有一个 ``"viewer"`` 默认值，那是给单测与
+    评测干跑用的。接口层若忘了传，问答照样跑完、事件流照样完整，只是**权限一律按
+    viewer 算**：一个 admin 或 data_owner 提问会莫名其妙地受限，而没有任何一处报错。
+    这类"漏传一个参数、行为静默变错"的失配，只能靠在边界上钉一次。
+    """
+    seen: list[str] = []
+
+    class Recording(StubService):
+        async def stream(
+            self, query: str, *, user_id: str, role: str = "viewer", turn=None
+        ) -> AsyncIterator[dict]:
+            seen.append(role)
+            yield {"type": "done", "correction_count": 0, "row_count": 0}
+
+    monkeypatch.setattr(query_api, "QueryService", Recording)
+
+    async with _client() as client:
+        await client.post("/api/v1/query", json={"query": "各季度销售额"})
+
+    assert seen == [FAKE_USER.role]
 
 
 # ==========================================================================

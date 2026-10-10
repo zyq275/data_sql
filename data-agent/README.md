@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 8 可解释性与可视化推荐**。
+当前进度：**阶段 9 数据权限治理**。
 
 ## 环境要求
 
@@ -110,13 +110,18 @@ uv pip install -e ".[dev]"            # 测试依赖
 跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
 那是真问题，测试必须失败，不会被跳过掩盖。
 
-跑阶段 5 / 阶段 7 / 阶段 8 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
+跑阶段 5 / 阶段 7 / 阶段 8 / 阶段 9 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/test_stage5_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage7_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage8_acceptance.py -v -s
+.venv/Scripts/python.exe -m pytest tests/test_stage9_acceptance.py -v -s
 ```
+
+阶段 9 那组会往 `permission` 表里写配置，用例进出两头各做一次快照与还原
+（见 `test_permission_api.py` 的 `_isolate`）——角色只有三个固定取值，用不了
+"每次跑一个随机名字"那套隔离办法，而直接删又会吃掉管理员手配的权限。
 
 ## 验证清单（阶段 1 验收）
 
@@ -127,7 +132,7 @@ uv pip install -e ".[dev]"            # 测试依赖
 | CORS 通配符被拦截 | 生产模式（`APP__DEBUG=false`）下设 `CORS_ORIGINS=["*"]`，启动即报错 |
 | Alembic 能执行一次空迁移 | `alembic upgrade head`（需先建库并配置口令） |
 
-## 接口清单（阶段 3 + 阶段 5 + 阶段 7）
+## 接口清单（阶段 3 + 阶段 5 + 阶段 7 + 阶段 9）
 
 | 方法 | 路径 | 鉴权 |
 |---|---|---|
@@ -147,11 +152,19 @@ uv pip install -e ".[dev]"            # 测试依赖
 | POST | `/api/v1/admin/users` | admin |
 | PUT | `/api/v1/admin/users/{id}/role` | admin |
 | PUT | `/api/v1/admin/users/{id}/status` | admin |
+| GET | `/api/v1/permissions` | admin（`page`/`page_size`/`role`） |
+| POST | `/api/v1/permissions` | admin |
+| PUT | `/api/v1/permissions/{id}` | admin（整条替换，三个字段都要传） |
+| DELETE | `/api/v1/permissions/{id}` | admin |
+| GET | `/api/v1/permissions/resources` | admin（可授权的表/字段清单，id ↔ 名字对照） |
+| GET | `/api/v1/permissions/roles/{role}/scope` | admin（该角色**实际**生效的范围） |
 
 响应统一为 `{"code": 0, "message": "ok", "data": ...}`；出错时 `code` 为业务码
 （40000 参数/业务规则、40100 认证、40101 令牌过期、40102 令牌无效、40200 查询请求不合法、
 40201 SQL 生成失败、40202 SQL 执行失败、40203 SQL 未通过安全校验、40204 查询超时、
 40300 权限、40400 资源、50000 服务、50001 LLM 上游不可用），HTTP 状态码按类别同步返回。
+40203 自阶段 9 起兼表「SQL 引用了当前角色未授权的表或字段」（BR-PERM-001）：两者都是
+"这条语句不该被执行"，且都应当走 correct_sql 重写一遍再试，故复用同一个码。
 `/health` 与 `/health/ready` 是探针，按约定返回裸结构、不套信封；`/api/v1/query` 是 SSE，
 响应体是事件序列、同样不套信封。
 
@@ -594,6 +607,70 @@ k=60 时第 1 名与第 2 名只差 ≈0.0003，而另一路投的一票 ≥1/61
 规则的逐条正反例另在 `tests/test_visualization.py` 里用纯函数覆盖（不碰图、不碰 LLM），
 四条规则之外的边界——整数时间列、标识列、bool 列、全 NULL 列、退化行——都在那边。
 
+## 数据权限治理（阶段 9）
+
+| 文件 | 职责 |
+|---|---|
+| `agent/permissions.py` | 范围计算与裁剪：`PermissionScope`（判定核心）、`PermissionGateway`（按角色取配置）、`build_scope`（纯函数） |
+| `api/v1/permission.py` | admin 的权限配置接口（FR-PERM-002） |
+| `services/permission_service.py` | 配置的增删改查 + "配了什么"与"算出什么"的对账 |
+| `agent/nodes/validate_sql.py` | 兜底：SQL 里出现越权的表/字段则拒掉，交给 correct_sql 重写 |
+
+**权限只有一层，就是 `permission` 表**：某角色有哪些 `table` / `column` 行，就只用得了
+那些表与字段。没有第二套规则（没有"admin 天然全通"，也没有角色继承），于是
+"某个角色能看什么"永远只有一个地方能回答。整组配置接口要求 admin。
+
+**没有配置的角色视为不设限**（`unrestricted`）。这条最容易配错，所以写在最前面：
+全新环境里 `permission` 表是空的，按白名单严格解读的话，所有角色——包括管理员——
+的每一次提问都取不到任何一张表。一个刚部署完、还没人配过权限的系统不该是这个样子。
+一旦某角色有了哪怕一条记录，就按白名单严格执行：**"开始配置"这个动作本身就是开关**。
+它的另一面是：把某角色最后一条配置删掉，等于把它退回不设限，而不是"清空权限"。
+
+授权语义有两条值得单独说（都由 `agent/permissions.py` 的用例钉住）：
+
+- **一张表只要有一个字段级授权，整张表就按字段级收窄**。这样"先授整表、再收窄到几列"
+  才表达得出来；反之只有表级授权（没有任何字段行）时视为整表可用，**含以后新增的字段**
+  ——知识库重建后不必再配一遍。这也是 `tables` 的值用 `None` 表示"整表"、
+  而不是把当前字段名列出来的原因。
+- **指标按它关联的字段判可见**（口径里写着 `SUM(某字段)`，它本身就是说明书）。
+  一个字段都没关联的指标在受限范围内一律不可见，并记 WARNING：没有依据能证明它只碰
+  已授权的字段，宁可不给，而"指标凭空消失"是最难查的一类故障。
+
+**两道闸门，缺一不可**。前置裁剪让模型根本看不到未授权的名字，后置兜底校验
+（`validate_sql` 的第二道关）拦住模型自己编出来的表名、以及从历史轮次带进来的旧表名。
+四处泄漏点都堵了：`filter_table_info` / `filter_metric_info` 两个提示词的候选集、
+`generate_sql` / `correct_sql` 的表结构与指标文本、以及 `history_text`——
+**引用已无权限对象的那些历史轮次会被整轮丢掉**（留半句上下文比不留更坏）。
+
+后置校验里有两条口径是实测出来的：
+
+- **字段要按"它出现在哪张表上"判，不能平铺成一个名字集合**。字段名在数仓里不唯一
+  （`fact_order.product_id` 与 `dim_product.product_id` 同名），平铺的话
+  "dim_product 只授了 brand"会让 `SELECT product_id FROM fact_order` 被判越权——
+  而它碰的是一张整表授权的表。后果不是少给数据而是**模型改不掉**：问题不在 SQL 上，
+  拿着同一份裁剪过的表结构重写多少次都还是那句话，连试几轮之后整句失败，
+  用户看到的是"这个问法不行"。所以 `forbidden_columns` 是 `表名 → 字段名` 的分组。
+- **越权提示不点名**。`error` 事件最终会推给用户，里面若带着表名，就等于向无权者
+  确认了那张表存在、它大概长什么样。名字只进日志，给用户的那句话只说结果。
+
+**一轮问答内缓存，跨请求不缓存**：网关按角色缓存算出来的范围，而一个 `QueryContext`
+对应一轮问答，所以缓存的生命周期正好是这一轮。于是**没有"改完配置要清缓存"这一步**——
+管理员配完，下一句提问读到的就是新配置。反过来也要注意：同一轮里三处调用（表、指标、
+兜底校验）必须看到同一个范围，否则会出现"表被拦了、校验却放行"的自相矛盾中间态。
+
+## 验证清单（阶段 9 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 无权限的表/字段不出现在生成的 SQL 中 | `pytest tests/test_stage9_acceptance.py -v`：正向给一个角色开三张表，问出来的 SQL 只能引用这三张；反向只授 `dim_product` 的一个字段，拿一个它答不了的问题去问，"用户看得见的任何地方"（`sql` / `explain` / `error`）都不许出现未授权的名字 |
+| admin 可配置角色-表/字段映射 | 同上：同一句问题、同一个用户，配置前后**必须问出不一样的东西**（配置前能查到订单事实表，配完之后不能）——只断言"配完不越权"在"配置根本没生效"时也是绿的 |
+
+判定核心（`build_scope` 与 `PermissionScope`）的逐条用例另在 `tests/test_permissions.py`
+里用纯函数覆盖，不碰数据库、不碰 LLM：表级/字段级的叠加、整表授权含新增字段、
+字段名跨表同名、指标可见性、悬空引用（权限指向已从知识库删掉的表）。
+配置接口另在 `tests/test_permission_api.py` 里覆盖（重复配置、资源不存在、非 admin 403）。
+
+
 ## 目录结构
 
 ```
@@ -609,7 +686,8 @@ data-agent/
 │   ├── api/                   接口层：middleware / health / v1 路由
 │   ├── agent/                 智能体层：graph、state、context、events、llm、
 │   │                          prompts、parsing、knowledge、rendering、
-│   │                          visualization（图表推荐规则，纯函数）、nodes/，
+│   │                          visualization（图表推荐规则，纯函数）、
+│   │                          permissions（数据权限的范围计算与裁剪）、nodes/，
 │   │                          以及会话状态：checkpoint（选型/降级）、redis_checkpointer
 │   ├── retrievers/            dense / fulltext / fusion / candidate + retrieval 网关
 │   ├── clients/               外部连接生命周期管理（MySQL / Qdrant / ES / Redis / LLM / 重排）

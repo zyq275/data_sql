@@ -14,7 +14,13 @@ from __future__ import annotations
 import pytest
 
 from app.core.exceptions import SQLSecurityError
-from app.core.sql_security import assert_readonly, build_explain, leading_keyword
+from app.core.sql_security import (
+    assert_readonly,
+    build_explain,
+    leading_keyword,
+    referenced_names,
+    referenced_tables,
+)
 
 ACCEPTED = [
     "SELECT province FROM fact_order LIMIT 3",
@@ -129,3 +135,54 @@ def test_non_explainable_statements_are_not_prechecked(sql: str) -> None:
     返回 None 表示"没有预检语句"，由调用方按"不预检但放行"处理。
     """
     assert build_explain(sql) is None
+
+
+# ==========================================================================
+# 表名 / 标识符提取（阶段 9 的数据权限兜底校验用）
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT * FROM fact_order", {"fact_order"}),
+        ("SELECT r.a FROM fact_order o JOIN dim_region r ON o.region_id = r.id", {"fact_order", "dim_region"}),
+        # 库名限定与反引号包名都要归一到元数据里存的那个裸名字
+        ("SELECT * FROM dw.fact_order", {"fact_order"}),
+        ("SELECT * FROM `dw`.`fact_order`", {"fact_order"}),
+        # 逗号列表：只抓到第一张
+        ("SELECT * FROM a, b WHERE a.id = b.id", {"a", "b"}),
+        # 多词 JOIN 关键字
+        ("SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id", {"a", "b"}),
+        # 别名不能被当成表名：FROM t AS x / FROM t x
+        ("SELECT * FROM fact_order AS o JOIN dim_date d ON o.date_id = d.id", {"fact_order", "dim_date"}),
+        # 派生表：外层是括号，里面的表由内层自己的 FROM 收走
+        ("SELECT * FROM (SELECT * FROM fact_order) x", {"fact_order"}),
+        # 字符串字面量里的表名不算：否则备注里写一句 SQL 就会被判越权
+        ("SELECT * FROM fact_order WHERE note = 'from fact_sales'", {"fact_order"}),
+    ],
+)
+def test_referenced_tables_are_extracted(sql: str, expected: set[str]) -> None:
+    """提取要低估也不能高估错了方向——漏掉一张表，越权校验就形同虚设。"""
+    assert referenced_tables(sql) == expected
+
+
+def test_cte_names_are_extracted_but_harmless() -> None:
+    """CTE 名会被当成"表"提出来，但调用方是按**已知表名**求交集的。
+
+    这条用例把那个设计决定钉住：提取器不区分 CTE 与真表，所以 ``t`` 会出现在结果里；
+    而 ``t`` 不在元数据的表名集合里，越权判定自然忽略它。哪天有人给提取器加了
+    "排除 CTE"的逻辑，这条会红——那时要想清楚值不值得（见 referenced_tables 的说明）。
+    """
+    assert referenced_tables("WITH t AS (SELECT * FROM fact_sales) SELECT * FROM t") == {
+        "fact_sales",
+        "t",
+    }
+
+
+def test_referenced_names_collects_columns_aliases_and_tables() -> None:
+    """标识符提取不区分角色：字段名、别名、表名一视同仁。"""
+    names = referenced_names("SELECT o.order_amount FROM fact_order o")
+    assert {"o", "order_amount", "fact_order"} <= names
+    # 字符串字面量与注释里的东西不是标识符
+    assert "drop" not in referenced_names("SELECT a FROM t WHERE note = 'DROP' -- DROP")

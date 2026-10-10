@@ -15,12 +15,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent.graph import build_graph, route_after_validate
-from app.agent.knowledge import MetricSpec, TableSpec
+from app.agent.knowledge import ColumnSpec, MetricSpec, TableSpec
 from app.agent.parsing import parse_json_array, parse_json_object
+from app.agent.permissions import PermissionScope
 from app.agent.prompts import placeholders, render
 from app.agent.rendering import date_info_text, result_summary_text
 from app.agent.state import MAX_SQL_CORRECTIONS, initial_state
-from app.core.exceptions import LLMServiceError, ServiceError
+from app.core.exceptions import LLMServiceError, QueryError, ServiceError
 from app.core.text import strip_code_fence
 from app.repositories.dw import QueryResult
 from app.retrievers.retrieval import Candidate
@@ -35,7 +36,29 @@ TABLE = TableSpec(
     alias="订单事实表",
     description="每笔订单一行",
     is_dimension=False,
-    columns=[],
+    columns=[
+        # 字段级权限的用例要看着真实的字段名断言，所以这张表不能再是空字段列表
+        ColumnSpec(
+            name="province",
+            type="varchar(64)",
+            alias="省份",
+            description=None,
+            is_primary_key=False,
+            is_foreign_key=False,
+            ref_table=None,
+            ref_column=None,
+        ),
+        ColumnSpec(
+            name="order_amount",
+            type="decimal(18,2)",
+            alias="订单金额",
+            description=None,
+            is_primary_key=False,
+            is_foreign_key=False,
+            ref_table=None,
+            ref_column=None,
+        ),
+    ],
 )
 METRIC = MetricSpec(
     name="销售额",
@@ -75,7 +98,11 @@ class StubLLM:
         if "指标检索专家" in prompt:
             return '["销售额"]'
         if "表结构筛选专家" in prompt:
-            return '{"tables":[{"table_name":"fact_order","columns":["province","amount"]}]}'
+            # 字段名要写全（order_amount 而不是 amount）：模型的裁剪是"只留点名的
+            # 那几列"，写一个对不上的名字，字段会被 _trim 直接丢掉——那样
+            # "未授权字段没进提示词"的用例会因为**裁剪**而通过，权限那一段改了没改
+            # 都照样绿，等于没测
+            return '{"tables":[{"table_name":"fact_order","columns":["province","order_amount"]}]}'
         if "指标筛选专家" in prompt:
             return '["销售额"]'
         if "问句改写专家" in prompt:
@@ -130,6 +157,23 @@ class StubKnowledge:
         return [METRIC]
 
 
+class StubPermission:
+    """权限桩：默认返回"不设限"的范围。
+
+    与真实网关的默认语义一致（角色没有配置 = 不限制），这样这一批用例验的仍然是
+    "图跑得对不对"，而不是"权限配得对不对"——后者在 test_permissions 与
+    test_stage9_acceptance 里单独验。要验受限范围时直接塞一个 PermissionScope 进来。
+    """
+
+    def __init__(self, scope: PermissionScope | None = None) -> None:
+        self.scope = scope or PermissionScope.everything("analyst")
+        self.asked: list[str] = []
+
+    async def scope_for(self, role: str) -> PermissionScope:
+        self.asked.append(role)
+        return self.scope
+
+
 class StubDw:
     def __init__(self, *, fail_explain: bool = False) -> None:
         from app.core.exceptions import SQLExecutionError
@@ -159,13 +203,16 @@ def stub_context(
     sql: str = "SELECT province FROM fact_order",
     fail_explain: bool = False,
     explain_fails: bool = False,
+    scope: PermissionScope | None = None,
 ):
     return SimpleNamespace(
         user_id="u1",
+        role="analyst",
         llm=StubLLM(sql=sql, explain_fails=explain_fails),
         knowledge=StubKnowledge(),
         retrieval=StubRetrieval(),
         dw=StubDw(fail_explain=fail_explain),
+        permissions=StubPermission(scope),
     )
 
 
@@ -174,17 +221,22 @@ async def run_graph(
     sql: str = "SELECT province FROM fact_order",
     fail_explain: bool = False,
     explain_fails: bool = False,
+    scope: PermissionScope | None = None,
+    history: list[dict] | None = None,
 ):
     """跑一遍图，返回（自定事件列表, 终态）。"""
     graph = build_graph()
-    state = initial_state("去年华东区销售额前三的省份")
+    state = initial_state("去年华东区销售额前三的省份", history=history)
     events: list[dict] = []
     final = state
     async for mode, chunk in graph.astream(
         state,
         stream_mode=["custom", "values"],
         context=stub_context(
-            sql=sql, fail_explain=fail_explain, explain_fails=explain_fails
+            sql=sql,
+            fail_explain=fail_explain,
+            explain_fails=explain_fails,
+            scope=scope,
         ),
     ):
         if mode == "custom":
@@ -547,3 +599,119 @@ def test_result_summary_renders_null_and_long_cells_compactly() -> None:
 
     assert "NULL" in text
     assert "…" in text, "超长的一格要截短，否则几行样本就能把提示词撑满"
+
+
+# ==========================================================================
+# 数据权限（阶段 9）：越权的表与字段一个都不该进提示词、也不该进 SQL
+# ==========================================================================
+
+#: 一个受限范围：只放行 fact_order 的 province，别的表与字段都算越权。
+RESTRICTED = PermissionScope(
+    role="analyst",
+    unrestricted=False,
+    tables={"fact_order": frozenset({"province"})},
+    metrics=frozenset(),
+    forbidden_tables=frozenset({"dim_region", "dim_date", "fact_sales"}),
+    forbidden_columns={"fact_order": frozenset({"order_amount"})},
+)
+
+#: 连 fact_order 都不放行——用来验"召回得到、但一张都不许用"的那条分支。
+BLOCKED = PermissionScope(
+    role="analyst",
+    unrestricted=False,
+    tables={"dim_region": None},
+    metrics=frozenset(),
+    forbidden_tables=frozenset({"fact_order"}),
+    forbidden_columns={},
+)
+
+
+async def test_unauthorized_columns_never_reach_the_prompt() -> None:
+    """未授权的字段不该出现在表结构文本里（FR-PERM-001）。
+
+    断言的是 ``table_text`` 而不是最终 SQL：SQL 是模型写的，它这一轮恰好没用到
+    那个字段，并不能说明那个字段没进过提示词——提示词里出现过一次，就等于告诉了
+    模型它存在。
+    """
+    _events, final = await run_graph(scope=RESTRICTED)
+
+    assert "province" in final["table_text"], "用例前提不成立——授权的字段应当留下"
+    assert "order_amount" not in final["table_text"], "未授权的字段进了提示词"
+
+
+async def test_a_table_that_is_entirely_unauthorized_stops_the_query() -> None:
+    """召回得到的表全都不在授权范围内时，明确报错，而不是拿着空上下文去生成。
+
+    空上下文比报错危险得多：模型没有表名可用，就会开始编——而编出来的表名
+    既不在授权表里、也不在真实数仓里，用户拿到的是一段看着像 SQL 的幻觉。
+
+    节点抛的是 ``QueryError``，由服务层翻译成 error 事件（阶段 5 的约定：
+    图内部只把失败写进 ``error`` 字段，节点级的硬失败直接抛）。所以这里断言的是
+    异常本身，而不是终态里的 ``error``——图在这一步就断了，没有终态可言。
+    """
+    events: list[dict] = []
+    with pytest.raises(QueryError) as excinfo:
+        graph = build_graph()
+        async for mode, chunk in graph.astream(
+            initial_state("去年华东区销售额前三的省份"),
+            stream_mode=["custom", "values"],
+            context=stub_context(scope=BLOCKED),
+        ):
+            if mode == "custom":
+                events.append(chunk)
+
+    assert "授权" in excinfo.value.message, "报错要指出是权限问题，而不是「没召回到表」"
+    assert not [e for e in events if e["type"] == "sql"], "不该有任何 SQL 被生成出来"
+
+
+async def test_sql_referencing_an_unauthorized_table_is_rejected() -> None:
+    """模型自己编了一个越权表名时，兜底校验要拦下它（BR-PERM-001）。
+
+    前面的裁剪管的是"模型看得到什么"，管不了"模型写了什么"——它完全可能凭空写出
+    一张没见过的表。所以校验节点还要再判一次，而且要判在 EXPLAIN 之前：
+    预检会把这条语句发给数仓。
+    """
+    events, final = await run_graph(sql="SELECT * FROM dim_region", scope=RESTRICTED)
+
+    assert final["error"], "越权的 SQL 不该通过校验"
+    assert not [e for e in events if e["type"] == "result"], "不该真的执行它"
+    assert "dim_region" not in final["error"], (
+        "给用户看的报错不能带上表名——那等于向无权者确认这张表存在"
+    )
+
+
+async def test_sql_touching_an_unauthorized_column_is_rejected() -> None:
+    """字段级同理：表用对了，字段写了个没授权的也不行。"""
+    events, final = await run_graph(
+        sql="SELECT order_amount FROM fact_order", scope=RESTRICTED
+    )
+
+    assert final["error"], "越权字段不该通过校验"
+    assert not [e for e in events if e["type"] == "result"]
+    assert "order_amount" not in final["error"]
+
+
+async def test_history_sql_touching_an_unauthorized_table_is_dropped() -> None:
+    """历史里那条用了已失权表的 SQL，不能原样进提示词。
+
+    权限是会被改小的，而会话比权限活得久：上一轮能查的表，这一轮可能已经不能查了。
+    不裁的话，越权的表名会从这条旁路原样进提示词，前面所有裁剪都白做。
+    """
+    _events, final = await run_graph(
+        scope=RESTRICTED,
+        history=[
+            {"query": "各地区销售额", "sql": "SELECT region_name FROM dim_region"},
+            {"query": "各省份销售额", "sql": "SELECT province FROM fact_order"},
+        ],
+    )
+
+    assert "dim_region" not in final["history_text"], "带越权表的历史轮次没被剔除"
+    assert "province" in final["history_text"], "无关的历史轮次不该被一起剔掉"
+
+
+async def test_unrestricted_scope_leaves_everything_alone() -> None:
+    """"没配过权限"就等于不限制——这是全新环境的默认语义，不能悄悄改成"什么都不给"。"""
+    _events, final = await run_graph(scope=PermissionScope.everything("analyst"))
+
+    assert final["error"] is None
+    assert "order_amount" in final["table_text"]
