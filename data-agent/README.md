@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 11 可观测性**。
+当前进度：**阶段 12 前端落地**（全部 12 个阶段的开发已完成）。
 
 ## 环境要求
 
@@ -145,6 +145,15 @@ span——跑三遍就是三次模型调用、三倍等待，而且三次之间�
 用例用随机后缀命名、只删自己建的那些，不动开发库里可能存在的评测集。
 
 阶段 10 那组要跑好几次真实评测，本机大约 45 秒。
+
+前端（阶段 12）没有自动化测试，验收靠构建 + 人工核对：
+
+```bash
+cd ../data-agent-frontend && npm run build    # vue-tsc 类型检查 + vite build
+```
+
+构建通过只说明类型与构建无误，**不等于**交互正确——阶段 12 的验收是人工的，
+清单见「验证清单（阶段 12 验收）」。
 
 ## 验证清单（阶段 1 验收）
 
@@ -948,6 +957,67 @@ request_id 的断言读的都是 OTel 一侧。Langfuse 那侧的接线另有 `t
 走 `GET /api/public/v2/observations?fromStartTime=&toStartTime=`，
 **并且必须带 `fields=metadata,usage,metrics`**——默认只回 core+basic，看不到元数据与用量。
 
+## 前端落地（阶段 12）
+
+前端在独立目录 `../data-agent-frontend`（Vue 3 + TypeScript + Element Plus + ECharts）。
+开发期 `npm run dev`（固定 5173），Vite 把 `/api` 与 `/health` 代理到 8000；
+生产由 Nginx 承担同样的转发并在其侧关闭 SSE 缓冲（TDD 14.1）。
+
+前后端的**契约面**：统一信封 `{code, message, data}`、分页
+`{items, total, page, page_size}`、SSE 六种事件（`progress` / `sql` / `result` /
+`explain` / `viz` / `error` / `done`）。前端的类型逐字段对着 `app/schemas/*.py` 抄，
+不是照着文档草稿写的——文档给的是示意，实际字段名以 schema 为准。
+
+### 设计系统先于页面
+
+`src/styles/tokens.css` 是唯一的色值/圆角/阴影/字号来源，页面里只写 `var(--da-*)`。
+文件末尾把 `--el-color-primary` 等映射到 `--da-*`，让 Element Plus 组件与自研部分
+共用一套色；不做这层映射就会出现"按钮是 EP 默认蓝、旁边标签是另一套蓝"的两套蓝并存，
+这正是"配色散乱"最典型的来源。图表调色板也是 Token，JS 侧经 `tokenColor()` 读取。
+
+样式加载顺序有语义（`main.ts`）：EP 样式 → tokens.css → base.css。
+把 Token 提到 EP 之前，映射会被 EP 的默认值覆盖，全局只剩默认蓝。
+
+### 三处与后端行为绑定的实现
+
+| 位置 | 为什么必须这么做 |
+|---|---|
+| `api/query.ts` 用 `fetch` 而非 `EventSource` | 问答接口是 **POST**（问题原文进请求体，不进 URL 与访问日志），而原生 `EventSource` 只支持 GET |
+| 帧解析按**空行**切，不按换行 | 一帧内部本来就有换行（`event:` 行 + `data:` 行），按换行切会把每行当成一帧 |
+| 只有业务码 **40101** 触发续期 | 40100（凭据不对）与 40102（令牌无效）去 refresh 无意义或有害；三者分工见 `core/exceptions.py` |
+
+### 角色门槛
+
+`/dashboard` 要求 analyst 及以上，`/admin/*` 要求 admin，写在路由 `meta.requiresRole`；
+侧栏菜单**由同一份数据过滤生成**，加页面时不会漏判角色。
+这是**体验层的拦截，不是安全边界**——真正的拒绝在后端依赖（40300）。
+前端判断错了，后果是"某个入口该藏没藏"，不是"越权拿到了数据"。
+
+### 验收方式
+
+阶段 12 的验收标准（设计系统统一 / 问答页四件套 / 多轮与重开加载历史 / 看板角色入口 /
+个人设置 / 空状态与加载态）**是人工核对的**，命令是 `npm run build` 通过 +
+浏览器里点一遍。`npm run build`（vue-tsc 类型检查 + vite build）通过只说明类型与构建
+无误，**不等于**交互正确——比如"输入法组字期间的回车会不会误发"、
+"切换会话后上一轮的结果会不会串到下一轮"，这两类问题类型系统看不出来。
+
+## 验证清单（阶段 12 验收）
+
+前置：后端在 8000 运行、前端 `npm run dev` 在 5173 运行，浏览器打开
+http://localhost:5173 。三类账号各备一个（viewer / analyst / admin）。
+
+| 验收项 | 怎么核 |
+|---|---|
+| 设计系统统一（配色/圆角/间距走 Token） | 在 `data-agent-frontend/src/` 下搜 `#[0-9a-fA-F]`，命中应当**只在 `utils/chart.ts`**（`tokenColor()` 的兜底值，见该函数注释），页面与组件里一处也不该有；再改 tokens.css 里的 `--da-color-primary` 一个值，登录页左栏、按钮、侧栏选中态、图表第一条线应同时变色 |
+| 问答页展示表格 + SQL + 解释 + 图表 | 用一个能出数的业务问题提问（如"去年各地区的销售额"），确认四块都在；点「柱状图/折线图/饼图」切换，图随切换重绘且**不重新提问**（进度条不再出现） |
+| 支持多轮会话 | 连续追问两轮（第一轮问全量，第二轮问"那只看华东"），第二轮结果应受第一轮约束；侧栏会话标题为第一句话 |
+| 重开会话时能加载历史消息 | 切到别的会话再切回来，或直接刷新 `/chat/<会话id>`：历史消息逐轮还原，含 SQL、结果表与解释 |
+| 数据看板页仅 analyst 及以上可见入口，viewer 不可进入 | 用 viewer 登录：侧栏**没有**「数据看板」；手输 `/dashboard` 应落到 403 页。用 analyst 登录：菜单有它，页面能出图与趋势 |
+| 个人设置页展示当前用户信息，可完成修改密码 | 信息与 `/auth/me` 返回一致；改密后旧密码登录被拒、新密码可登录；两次新密码不一致时表单当场拦住 |
+| 空数据有占位，加载有状态 | 空历史的账号看「查询历史」、评测集为空时看「评测看板」、问一个查不到数据的问题：三处都是**说明性的占位**（"查询成功，但没有匹配的数据"），不是空白也不是报错；首屏有骨架屏而不是白屏 |
+| 导出 CSV | 问答页结果区点「导出 CSV」，Excel 打开中文不乱码（BOM），负数仍是数字可参与计算 |
+| 越权接口仍被后端拦住 | 用 viewer 的令牌直接 `curl /api/v1/admin/users`，返回 40300；前端隐藏菜单只是体验层 |
+
 ## 目录结构
 
 ```
@@ -982,6 +1052,20 @@ data-agent/
 │                              `eval_case` 表里、经接口增删，不需要文件形态的评测集，
 │                              所以这里目前只有 .gitkeep
 └── tests/                     单元测试
+
+../data-agent-frontend/       # 前端（阶段 12）
+├── vite.config.ts            代理 /api 与 /health 到 8000；固定端口 5173；
+│                             构建块按 echarts / element-plus / 业务代码分开
+└── src/
+    ├── api/                  http（信封拆解/令牌/续期）、query（SSE）、各业务模块
+    ├── stores/               Pinia：auth（登录态与角色）
+    ├── router/               路由与守卫（登录校验 + meta.requiresRole）
+    ├── layouts/              DefaultLayout：侧栏 + 顶栏 + 内容区
+    ├── components/           EmptyState / LoadingBlock / EChart / SqlBlock / ResultViewer
+    ├── views/                登录 / 问答 / 历史 / 看板 / 个人设置 /
+    │                         用户管理 / 权限管理 / 评测看板 / 403 / 404
+    ├── utils/                storage / role / labels / csv / chart / echarts
+    └── styles/               tokens.css（设计 Token）+ base.css
 ```
 
 ## 已知环境注意事项

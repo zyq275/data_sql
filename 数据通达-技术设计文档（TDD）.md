@@ -129,9 +129,19 @@ data-agent/                        # 后端
 ├── evals/                         # 评测集与评测脚本
 └── tests/                         # 单元测试
 data-agent-frontend/               # 前端
-├── src/
-│   ├── api/ stores/ router/ layouts/ views/
-│   └── styles/                    # 设计 Token
+├── vite.config.ts                 # 代理 /api 与 /health；固定端口 5173；构建分块
+└── src/
+    ├── api/                       # http（信封拆解/令牌/续期）、query（SSE）、
+    │                              # types（后端契约的前端副本）、各业务模块
+    ├── stores/                    # Pinia：auth（登录态与角色）
+    ├── router/                    # 路由与守卫（登录校验 + meta.requiresRole）
+    ├── layouts/                   # DefaultLayout：侧栏 + 顶栏 + 内容区
+    ├── components/                # EmptyState / LoadingBlock / EChart /
+    │                              # SqlBlock / ResultViewer（表格·图表·导出）
+    ├── views/                     # 登录 / 问答 / 历史 / 看板 / 个人设置 /
+    │                              # 用户管理 / 权限管理 / 评测看板 / 403 / 404
+    ├── utils/                     # storage / role / labels / csv / chart / echarts
+    └── styles/                    # 设计 Token
 ```
 
 ---
@@ -1022,6 +1032,7 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 | 优雅启停 | lifespan 中 init/close ClientManager |
 | 超时与重试 | LLM 超时+重试；SQL max_execution_time + 行数上限 |
 | 日志分级 | loguru 统一出口（阶段 11 接管标准库 logging），级别由 `observability.log_level` 配置 |
+| 界面一致性 | 设计 Token 统一色值/圆角/阴影/字号/图表配色，页面不写死值；空态与加载态用统一组件（实现说明见 §10.2） |
 | 数据库迁移 | Alembic 管理 schema 演进 |
 
 > **日志目前只输出到 stderr，没有配文件 sink**（也没有 rotation/retention）：
@@ -1084,6 +1095,49 @@ top-1 自己变了，用例会失败并要求同步更新本节——避免"限�
 **不拒绝请求**：request_id 是排障线索，不是安全边界。中间件是裸 ASGI 而非
 `BaseHTTPMiddleware`，后者会把响应包进额外的 anyio 任务，SSE 的边生成边推送会被
 缓冲成最后一次性吐出。
+
+### 10.2 实现说明（阶段 12）
+
+**Token 是唯一色源，且要接到 Element Plus 上。** `styles/tokens.css` 定义
+`--da-*`，文件末尾把 `--el-color-primary` 等映射过去——不做这层映射，就会出现
+"按钮是 EP 默认蓝、旁边标签是我们自己的蓝"的两套蓝并存，这正是"配色散乱"最常见的
+来源。样式加载顺序因此有语义：EP 样式 → tokens.css → base.css；把 Token 提到 EP
+之前，映射会被 EP 的默认值覆盖。图表调色板也是 Token（`--da-chart-*`），JS 侧经
+`utils/chart.ts::tokenColor()` 读取，不在代码里重写一份——同一个指标在问答页与看板页
+必须是同一个颜色。
+
+**空态与加载态是组件，不是各自的 `v-if`。** 空态统一走 `EmptyState`，文案要说
+**为什么空**（"查询成功，但没有匹配的数据" ≠ "还没有查询结果"），不同原因指向
+不同的下一步。加载态统一走 `LoadingBlock`（骨架屏）而不是 `v-loading` 遮罩：
+遮罩底下什么都没有，用户不知道将来会出现几行什么，而且数据到达时布局会跳一下。
+
+**与后端行为绑定的三处前端实现**（写错了都不会报错，只会表现成"偶发怪事"）：
+
+| 位置 | 必须这么做 | 否则 |
+|---|---|---|
+| SSE 客户端用 `fetch` 而非 `EventSource` | 问答接口是 POST（问题原文进请求体，不进 URL、不进访问日志） | 迁就 `EventSource` 就得把问题塞进 query string |
+| SSE 帧按**空行**切分 | 一帧内部本来就有换行（`event:` + `data:`） | 按换行切会把每行当成一帧，`event:` 行被丢弃、`data:` 行失去类型 |
+| 只有业务码 **40101** 触发令牌续期 | 40100 是凭据不对、40102 是令牌无效 | 登录页输错密码就会触发一次 refresh，变成莫名其妙的登录状态变化 |
+
+并发请求同时过期时共享同一个 refresh Promise：各续各的会有多个 refresh 同时在飞，
+后到的被先到的作废（表现为"刷新页面偶尔被踢回登录页"）。
+
+**图表推荐只给类型，不给字段映射。** 后端 `visualization.Recommendation` 只有
+`chart_type` 与 `message`，所以前端要按"这列的值是不是数字"自己分维度与度量——
+与后端判"该不该画折线"用的是同一套朴素规则。折线图还要把**多个时间维度拼成一个标签**
+（`year` + `quarter` 是本项目时间轴的常见形状），只取第一列会出现"2024、2024、2024…"
+一格一格的重复标签，走势图失去可读性。
+
+**看板的默认图表类型是前端补的**：`DashboardMetricsResponse` 与问答链路的
+`viz` 事件不同，它不带推荐字段（看板走确定性模板 SQL，不经过
+`recommend_visualization` 节点）。这里按同一条规则给个初始值，且**它只是初始视图**，
+用户随时可切——一个默认值判错，代价是一次点击。
+
+**角色门槛写在路由 `meta.requiresRole`，侧栏菜单由同一份数据过滤生成。**
+这是**体验层的拦截，不是安全边界**：真正的拒绝在后端依赖（`require_min_role` /
+`require_admin`，返回 40300）。前端判断错了，后果是"某个入口该藏没藏"，
+不是"越权拿到了数据"——所以它不需要与后端权限表严格对齐，只需与本阶段的
+角色定义（PRD 4.1）一致。
 
 ---
 
@@ -1251,4 +1305,4 @@ make eval        # 运行评测
 | 9 | 数据权限：权限模型 + SQL 生成上下文注入 | 权限治理 |
 | 10 | 评测体系与数据看板：评测集 + 批量评测 + eval_run 记录 + 看板接口 | 效果度量 |
 | 11 | 可观测：request_id 贯穿日志、OTel 链路、Langfuse LLM 追踪、节点耗时与召回命中数 | 链路追踪（实现说明见 §10.1） |
-| 12 | 前端：设计系统 + 会话 UI + 可解释展示 + 个人设置 + 数据看板 + 评测看板 | 交互落地 |
+| 12 | 前端：设计系统 + 会话 UI + 可解释展示 + 个人设置 + 数据看板 + 评测看板 | 交互落地（实现说明见 §10.2） |

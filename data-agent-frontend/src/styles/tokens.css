@@ -1,0 +1,155 @@
+/*
+ * 设计 Token（阶段 12 验收项"设计系统统一"）。
+ *
+ * **先有这一层，再有页面**：页面里只写 `var(--da-xxx)`，不写死色值、圆角、阴影。
+ * 验收时"配色/圆角/间距走 Token"这一条才可核查——若某个页面里散着 #315efb 这类
+ * 字面量，改主色就得靠全文搜索，且必然漏。
+ *
+ * 命名前缀 `da-`（data-agent），避免与 Element Plus 的 `--el-*` 撞名。
+ * 变量分两组：
+ *   1. `--da-*` —— 我们自己的语义 Token，页面只用这一组；
+ *   2. 文件末尾把 `--el-color-primary` 等映射到 `--da-*` —— 让 Element Plus 组件
+ *      与自研部分共用同一套色。不做这层映射的话，会出现"按钮是 EP 默认蓝、
+ *      旁边的标签是我们自己的蓝"这种两套蓝并存，是"配色散乱"最典型的来源。
+ */
+
+:root {
+  /* ---- 主色与功能色 ----
+   * 主色取偏靛的蓝：截图与图表里比 EP 默认的 #409eff 更沉，长时间盯表格不刺眼。
+   * light-N 是主色与白色按 N/10 混合的结果，dark-2 是与黑色混合 —— 数值由该规则算出，
+   * 不是随手挑的近似色；改主色时请按同一条规则重算，否则 EP 组件的 hover 态会偏色。 */
+  --da-color-primary: #315efb;
+  --da-color-primary-hover: #274bc9;
+  --da-color-primary-active: #1f3ca6;
+  --da-color-primary-light-3: #6e8efc;
+  --da-color-primary-light-5: #98affd;
+  --da-color-primary-light-7: #c1cffe;
+  --da-color-primary-light-8: #d6dffe;
+  --da-color-primary-light-9: #eaefff;
+  --da-color-primary-rgb: 49, 94, 251;
+
+  --da-color-success: #17a673;
+  --da-color-warning: #d98f00;
+  --da-color-danger: #e5484d;
+  --da-color-info: #7b8496;
+
+  /* ---- 文本 ---- */
+  --da-color-text-primary: #1f2430;
+  --da-color-text-regular: #4a5261;
+  --da-color-text-secondary: #7b8496;
+  --da-color-text-placeholder: #a8b0bf;
+  --da-color-text-inverse: #ffffff;
+
+  /* ---- 背景与描边 ---- */
+  --da-color-bg-page: #f5f7fb;
+  --da-color-bg-card: #ffffff;
+  --da-color-bg-soft: #f7f9fc;
+  --da-color-bg-hover: #f2f5fa;
+  --da-color-border: #e3e7ee;
+  --da-color-border-light: #eef1f6;
+
+  /* ---- 代码块 ----
+   * SQL 代码块用深底：它能和周围的白卡片拉开层次，读者一眼就知道"这块是另一类东西"。
+   * 浅底代码块在满屏表格里会被当成又一个表格单元。 */
+  --da-color-code-bg: #1e2430;
+  --da-color-code-text: #e6ebf5;
+  --da-color-code-accent: #7f9cff;
+
+  /* ---- 圆角 ---- */
+  --da-radius-sm: 4px;
+  --da-radius-md: 8px;
+  --da-radius-lg: 12px;
+  --da-radius-pill: 999px;
+
+  /* ---- 阴影 ---- */
+  --da-shadow-sm: 0 1px 2px rgba(23, 33, 56, 0.06);
+  --da-shadow-md: 0 4px 16px rgba(23, 33, 56, 0.08);
+  --da-shadow-lg: 0 12px 32px rgba(23, 33, 56, 0.12);
+
+  /* ---- 字号 ---- */
+  --da-font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial,
+    sans-serif;
+  --da-font-family-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, 'Courier New', monospace;
+  --da-font-xs: 12px;
+  --da-font-sm: 13px;
+  --da-font-base: 14px;
+  --da-font-md: 16px;
+  --da-font-lg: 18px;
+  --da-font-xl: 20px;
+  --da-font-display: 28px;
+
+  --da-line-height-tight: 1.3;
+  --da-line-height-base: 1.6;
+
+  /* ---- 间距 ----
+   * 4 的倍数递增。间距写成 var 而不写字面量，页面节奏才对得上——
+   * 12 和 13 混用肉眼看不出来，堆多了就是"说不清哪里乱"。 */
+  --da-space-1: 4px;
+  --da-space-2: 8px;
+  --da-space-3: 12px;
+  --da-space-4: 16px;
+  --da-space-5: 24px;
+  --da-space-6: 32px;
+
+  /* ---- 图表调色板 ----
+   * 图表颜色也是设计系统的一部分，理由和正文颜色一样：两条趋势线若各自在页面里
+   * 挑颜色，同一个指标在问答页和看板页会是两个颜色，看图的人会以为换了东西。
+   * 顺序有讲究——前两色是主色与成功色，单序列与双序列（最常见）因此自动落在
+   * 品牌蓝和它最不打架的邻色上。
+   * JS 侧经 utils/chart.ts 的 tokenColor() 读取，不在代码里重写一份。 */
+  --da-chart-1: #315efb;
+  --da-chart-2: #17a673;
+  --da-chart-3: #d98f00;
+  --da-chart-4: #7c5cff;
+  --da-chart-5: #12a5b8;
+  --da-chart-6: #e5484d;
+
+  /* ---- 骨架尺寸 ---- */
+  --da-header-height: 56px;
+  --da-sider-width: 216px;
+  --da-content-max-width: 1200px;
+  --da-transition: 0.2s ease;
+}
+
+/*
+ * 把 Token 接到 Element Plus 上。
+ *
+ * EP 的组件样式全部走它自己的 `--el-*` 变量，所以映射一次即可全局生效，
+ * 不需要去覆盖具体组件的类名（覆盖类名会随 EP 版本升级而失效）。
+ */
+:root {
+  --el-color-primary: var(--da-color-primary);
+  --el-color-primary-light-3: var(--da-color-primary-light-3);
+  --el-color-primary-light-5: var(--da-color-primary-light-5);
+  --el-color-primary-light-7: var(--da-color-primary-light-7);
+  --el-color-primary-light-8: var(--da-color-primary-light-8);
+  --el-color-primary-light-9: var(--da-color-primary-light-9);
+  --el-color-primary-dark-2: var(--da-color-primary-hover);
+
+  --el-color-success: var(--da-color-success);
+  --el-color-warning: var(--da-color-warning);
+  --el-color-danger: var(--da-color-danger);
+  --el-color-error: var(--da-color-danger);
+  --el-color-info: var(--da-color-info);
+
+  --el-text-color-primary: var(--da-color-text-primary);
+  --el-text-color-regular: var(--da-color-text-regular);
+  --el-text-color-secondary: var(--da-color-text-secondary);
+  --el-text-color-placeholder: var(--da-color-text-placeholder);
+
+  --el-bg-color: var(--da-color-bg-card);
+  --el-bg-color-page: var(--da-color-bg-page);
+  --el-border-color: var(--da-color-border);
+  --el-border-color-light: var(--da-color-border-light);
+  --el-border-color-lighter: var(--da-color-border-light);
+
+  --el-border-radius-base: var(--da-radius-md);
+  --el-border-radius-small: var(--da-radius-sm);
+  --el-border-radius-round: var(--da-radius-pill);
+
+  --el-font-family: var(--da-font-family);
+  --el-font-size-base: var(--da-font-base);
+
+  --el-box-shadow-light: var(--da-shadow-sm);
+  --el-box-shadow: var(--da-shadow-md);
+}

@@ -1,8 +1,11 @@
 /*
- * 基础样式。
- * 设计 Token（主色、圆角、阴影、字号）与其他全局样式在阶段 12 统一建立，
- * 此处只做最小重置，避免提前固化视觉规范。
+ * 基础样式与几个跨页面复用的工具类。
+ *
+ * 具体色值/圆角/阴影一律来自 styles/tokens.css（设计 Token），本文件不写死值。
+ * main.ts 里 tokens.css 必须排在 element-plus 的样式之后、base.css 之前：
+ * 排在 EP 之前会被 EP 的默认变量盖掉，映射就白做了。
  */
+
 * {
   box-sizing: border-box;
 }
@@ -16,7 +19,114 @@ body,
 }
 
 body {
-  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
-  color: var(--el-text-color-primary);
-  background-color: var(--el-bg-color-page);
+  font-family: var(--da-font-family);
+  font-size: var(--da-font-base);
+  line-height: var(--da-line-height-base);
+  color: var(--da-color-text-primary);
+  background-color: var(--da-color-bg-page);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--da-color-primary);
+  text-decoration: none;
+}
+
+/* ---- 滚动条 ----
+ * 表格与消息列表会频繁滚动，系统默认滚动条在浅色页面上过于抢眼。 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--da-color-border);
+  border-radius: var(--da-radius-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--da-color-text-placeholder);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- 卡片 ----
+ * 统一卡片样式：EP 的 el-card 默认阴影偏重，满屏卡片会显得脏。
+ * 用一层极浅的描边 + 轻阴影，层次靠边框而不是靠阴影堆。 */
+.da-card {
+  background: var(--da-color-bg-card);
+  border: 1px solid var(--da-color-border-light);
+  border-radius: var(--da-radius-lg);
+  box-shadow: var(--da-shadow-sm);
+}
+
+/* ---- 页面骨架 ---- */
+.da-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--da-space-4);
+}
+
+.da-page__title {
+  margin: 0;
+  font-size: var(--da-font-xl);
+  font-weight: 600;
+  line-height: var(--da-line-height-tight);
+}
+
+.da-page__subtitle {
+  margin: var(--da-space-1) 0 0;
+  font-size: var(--da-font-sm);
+  color: var(--da-color-text-secondary);
+}
+
+.da-page__header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--da-space-4);
+  flex-wrap: wrap;
+}
+
+/* ---- 代码块 ----
+ * 深底浅字，等宽字体。SQL 会换行显示，不横向滚动——横滚会把一句 SQL
+ * 的关键部分（GROUP BY、WHERE 条件）藏到视野外，而这恰恰是最该看见的部分。 */
+.da-code {
+  margin: 0;
+  padding: var(--da-space-4);
+  background: var(--da-color-code-bg);
+  color: var(--da-color-code-text);
+  border-radius: var(--da-radius-md);
+  font-family: var(--da-font-family-mono);
+  font-size: var(--da-font-sm);
+  line-height: var(--da-line-height-base);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
+/* ---- 文本工具类 ---- */
+.da-text-secondary {
+  color: var(--da-color-text-secondary);
+}
+
+.da-text-sm {
+  font-size: var(--da-font-sm);
+}
+
+.da-mono {
+  font-family: var(--da-font-family-mono);
+}
+
+/* ---- 路由切换过渡 ---- */
+.da-fade-enter-active,
+.da-fade-leave-active {
+  transition: opacity var(--da-transition);
+}
+
+.da-fade-enter-from,
+.da-fade-leave-to {
+  opacity: 0;
 }
