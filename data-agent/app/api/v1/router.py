@@ -12,7 +12,16 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1 import admin_users, auth, conversation, history, permission, query
+from app.api.v1 import (
+    admin_users,
+    auth,
+    conversation,
+    dashboard,
+    eval,
+    history,
+    permission,
+    query,
+)
 
 router = APIRouter()
 
@@ -22,3 +31,5 @@ router.include_router(query.router)
 router.include_router(conversation.router)
 router.include_router(history.router)
 router.include_router(permission.router)
+router.include_router(eval.router)
+router.include_router(dashboard.router)

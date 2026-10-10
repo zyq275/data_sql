@@ -3,7 +3,7 @@
 Text-to-SQL 智能数据问答 Agent。需求见《数据通达-需求规格说明书（PRD）.md》，
 设计见《数据通达-技术设计文档（TDD）.md》，开发节奏见《数据通达-开发步骤文档.md》。
 
-当前进度：**阶段 9 数据权限治理**。
+当前进度：**阶段 10 评测体系与数据看板**。
 
 ## 环境要求
 
@@ -87,6 +87,15 @@ CREATE DATABASE IF NOT EXISTS data_agent_meta
 .venv/Scripts/python.exe -m alembic revision --autogenerate -m "..."  # 阶段 2 起使用
 ```
 
+**阶段 10 起多了一个坑**：迁移 `b71e4a0c95d3` 给 `metric_info` 加了 `filter_sql` 列，
+而这一列的值来自 `conf/meta_config.yaml`、由构建脚本写进去。所以从阶段 9 升上来的库
+要**两步都做**，只做其中一步都不会报错，只会让看板的指标因为"没有过滤口径"而被拒：
+
+```bash
+.venv/Scripts/python.exe -m alembic upgrade head    # 1. 加列
+.venv/Scripts/python.exe -m app.scripts.build_meta  # 2. 重建知识库，把 filter_sql 填进去
+```
+
 ## 测试
 
 ```bash
@@ -110,18 +119,23 @@ uv pip install -e ".[dev]"            # 测试依赖
 跳过只判定「进程有没有在监听」：服务在跑但口令错、知识库没建、字段对不上，
 那是真问题，测试必须失败，不会被跳过掩盖。
 
-跑阶段 5 / 阶段 7 / 阶段 8 / 阶段 9 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
+跑阶段 5 / 阶段 7 / 阶段 8 / 阶段 9 / 阶段 10 的端到端验收（需要完整服务栈 + 真实 LLM Key）：
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/test_stage5_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage7_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage8_acceptance.py -v -s
 .venv/Scripts/python.exe -m pytest tests/test_stage9_acceptance.py -v -s
+.venv/Scripts/python.exe -m pytest tests/test_stage10_acceptance.py -v -s
 ```
 
-阶段 9 那组会往 `permission` 表里写配置，用例进出两头各做一次快照与还原
+阶段 9 与阶段 10 那两组会往 `permission` 表里写配置，用例进出两头各做一次快照与还原
 （见 `test_permission_api.py` 的 `_isolate`）——角色只有三个固定取值，用不了
 "每次跑一个随机名字"那套隔离办法，而直接删又会吃掉管理员手配的权限。
+评测样本与运行记录则相反：`eval_case` / `eval_run` 没有角色这类固定键，
+用例用随机后缀命名、只删自己建的那些，不动开发库里可能存在的评测集。
+
+阶段 10 那组要跑好几次真实评测，本机大约 45 秒。
 
 ## 验证清单（阶段 1 验收）
 
@@ -132,7 +146,7 @@ uv pip install -e ".[dev]"            # 测试依赖
 | CORS 通配符被拦截 | 生产模式（`APP__DEBUG=false`）下设 `CORS_ORIGINS=["*"]`，启动即报错 |
 | Alembic 能执行一次空迁移 | `alembic upgrade head`（需先建库并配置口令） |
 
-## 接口清单（阶段 3 + 阶段 5 + 阶段 7 + 阶段 9）
+## 接口清单（阶段 3 + 阶段 5 + 阶段 7 + 阶段 9 + 阶段 10）
 
 | 方法 | 路径 | 鉴权 |
 |---|---|---|
@@ -158,6 +172,14 @@ uv pip install -e ".[dev]"            # 测试依赖
 | DELETE | `/api/v1/permissions/{id}` | admin |
 | GET | `/api/v1/permissions/resources` | admin（可授权的表/字段清单，id ↔ 名字对照） |
 | GET | `/api/v1/permissions/roles/{role}/scope` | admin（该角色**实际**生效的范围） |
+| GET | `/api/v1/eval/cases` | admin（`page`/`page_size`） |
+| POST | `/api/v1/eval/cases` | admin（批量导入，单批上限 500 条） |
+| DELETE | `/api/v1/eval/cases/{id}` | admin |
+| POST | `/api/v1/eval/run` | admin（立刻返回 `running` 记录，批处理走后台） |
+| GET | `/api/v1/eval/runs` | admin（`page`/`page_size`，按时间倒序，供趋势图） |
+| GET | `/api/v1/eval/runs/{id}` | admin（四个指标 + 逐条明细，客户端轮询此接口） |
+| GET | `/api/v1/dashboard/dimensions` | analyst 及以上（可用维度 + 指标清单） |
+| GET | `/api/v1/dashboard/metrics` | analyst 及以上（`dimension` 必填；`metrics`/`start`/`end` 可选） |
 
 响应统一为 `{"code": 0, "message": "ok", "data": ...}`；出错时 `code` 为业务码
 （40000 参数/业务规则、40100 认证、40101 令牌过期、40102 令牌无效、40200 查询请求不合法、
@@ -671,6 +693,115 @@ k=60 时第 1 名与第 2 名只差 ≈0.0003，而另一路投的一票 ≥1/61
 配置接口另在 `tests/test_permission_api.py` 里覆盖（重复配置、资源不存在、非 admin 403）。
 
 
+## 评测体系与数据看板（阶段 10）
+
+| 文件 | 职责 |
+|---|---|
+| `api/v1/eval.py` | 评测集与运行记录接口（FR-EVAL-001~003），整组要求 admin |
+| `api/v1/dashboard.py` | 维度清单与聚合取数接口（FR-DASH-001~002），analyst 及以上 |
+| `services/eval_runner.py` | 批量执行与判分：驱动真链路、算四个指标、写回 `eval_run` |
+| `services/eval_service.py` | 评测集与运行记录的编排（导入去重、发起运行、分页查询） |
+| `services/dashboard_service.py` | 按指标口径拼模板 SQL，并按角色裁维度/指标/表 |
+| `repositories/eval.py` | `eval_case` / `eval_run` 的存取 |
+| `entities/meta_config.py` | `filter_sql` 的构建期校验（禁危险字符、字段必须表名限定且存在） |
+
+### 评测：跑的是线上那条链路，但不落线上数据
+
+**判分口径：以结果集为准，不比 SQL 文本。** 同一份意图可以有无数种写法（别名、
+JOIN 顺序、括号），文本不同不等于结果不同；用文本判会把正确答案判成错的，而准确率
+是拿来下"这次改动到底有没有变好"这个结论的，宁可口径保守也不要它虚低。三条路依次退：
+
+1. 样本自带 `expected_result` → 直接比（样本作者已经算好的答案）；
+2. 否则执行 `expected_sql`，拿它的结果来比；
+3. 标准 SQL 自己跑不动（数仓改过表、样本写错）→ 退化为归一化 SQL 文本比对，
+   **并把退化的原因写进判分说明**——判分依据悄悄换掉是最坏的一种，这一次的准确率
+   与上一次已经不是同一个口径了。
+
+比对是**顺序无关的多重集比较**，且按列名对齐：`ORDER BY` 本来就不保证跨索引、
+跨机器返回同一次序。金额比到小数点后 6 位（Decimal 经 JSON/float 走一圈有 1e-13 级
+的尾巴），而整数原样精确比——订单号是 bigint，经 float 会掉精度，
+"金额对得上、订单号对不上"这种差异最容易被当成噪声。
+
+**召回命中率**回答的是知识库维护者最关心的那个问题：这道题需要的表，召回与筛选有没有
+把它漏掉。基准是 `expected_sql` 用到的表（只认知识库里真实存在的名字，CTE 名与别名
+不算），看它们是否全部出现在**生成 SQL 时看得到的那份表清单**里。判不出来的样本
+（没有 `expected_sql`、或标准 SQL 一张已知表都没碰）返回 `None`，**从分母里排除，
+而不是算作未命中**——虚低的指标会让人去调一个本来没坏的召回链路。
+
+四个指标在 `eval_run` 里分别是 `accuracy` / `recall_hit_rate` / `execute_success_rate`
+/ `avg_duration_ms`，比例列是 `DECIMAL(6,4)`（先 `round(...,4)` 再转 `Decimal`，
+直接把二进制浮点塞进四位列会被 MySQL 严格模式拒收）。**空运行与判不出来的指标写 `None`
+而不是 0**：趋势图上 0 分是一根触底的线，看起来像"某次改动把系统搞崩了"，
+而实际只是那次没测成。
+
+**隔离靠"没有会话"，不靠"记得别写"**（BR-EVAL-001）。`QueryService(session=None)`
+在代码里就没有可写的库会话，图也走 `get_graph(persist=False)` 那张不挂 checkpointer
+的版本，于是 `conversation` / `message` / `query_history` / Redis 线程四样都不可能被写。
+换成"用一个真会话、但要小心地不 commit"，隔离就从结构问题变成了纪律问题，早晚会破。
+
+**发起运行立刻返回**：`POST /eval/run` 只写一条 `running` 记录并把批处理交给
+`BackgroundTasks`。一次几百条的评测要跑几十分钟，接口挂在那儿等既过不了网关超时，
+也让前端分不清"在跑"与"卡死"——客户端拿返回的 id 去 `GET /eval/runs/{id}` 轮询。
+后台任务**自己开库会话**（它脱离了请求上下文），且**失败不抛出**：把 `status` 置成
+`failed`、把已经跑出来的明细与原因留下，否则异常无人接收，只会变成"永远 running"。
+
+评测以**发起人的角色**跑：权限是问答链路的一部分，按别人的角色跑出来的成绩不是这次
+调用者的系统表现。未配置任何权限的角色不受限，所以全新环境里跑出来的正是模型本身的水平。
+
+### 看板：确定性拼装，不走模型
+
+同一个问题在两处必须有同一个答案。看板上的人要的是"一个确定的数"，让它经过一次模型
+生成，同一个问题两次刷新可能给出两个数，而这类差异没有人能解释。所以这里做的是
+**模板填空**：聚合表达式取 `metric_info.calculation`、过滤谓词取 `metric_info.filter_sql`、
+维度取代码里的白名单，全是确定性拼装，刷新多少次都是同一个数。
+
+**为什么新增了 `filter_sql` 这一列**：`filter_condition` 是给模型看的口径说明（散文），
+`calculation` 是聚合表达式，两者都不含可执行的过滤谓词——而"GMV 只算已支付订单"
+正是最要紧的那半句口径。缺了它，看板的数会把已取消、已退款的订单一起算进去：数字看着
+正常，只是偏大——本机样例数据上 2024-01 的 GMV 是 527193.63，而按口径应为 365673.77
+（已取消 679 行、已退款 660 行、已支付 2635 行），
+而问答与看板报出来的数不一样时，没有人能说清哪个对。于是加一列 `filter_sql` 存**谓词
+形式**（表名限定、不带 `WHERE`），与散文形式并存、口径必须一致。构建时校验：不允许
+`;` / `--` / `/*` / `*/`，每一处列引用都必须带表名限定且确实存在。
+
+**所选指标必须共用同一份口径**，否则 400：一条 `WHERE` 对所有指标生效，混着用会让
+本该过滤的多过滤一次、不该过滤的被打上，而结果看起来只是"数小了点"。
+
+**没写 `filter_sql` 的指标会被拒**（400，并点名是哪个指标），而不是按不过滤出数——
+按不过滤出数给出的是一个与问答链路口径不一致的数字，而它看着完全正常；两个数都
+"正常"时没有人会去对账，这次的错就会一直留着。确实不需要过滤的指标写
+`filter_sql: ""` 明说：`""` 是想清楚了，`None` 是漏写，两者分得开（`str | None`）。
+
+**维度白名单写在代码里**（10 个：`dim_date` 的 year/quarter/month/day、`dim_region` 的
+province/region_name、`dim_product` 的 category/brand、`dim_customer` 的
+gender/member_level）。哪些字段算"看板维度"是判断而不是事实：知识库回答"库里有什么
+字段"，这里回答"哪些字段适合做业务分组"——每张维表都有主键，把 `region_id` 摆进下拉框
+对业务人员没有意义。名字仍从 `column_info.column_alias` 取，知识库依旧是"字段叫什么"
+的唯一来源。
+
+JOIN 条件由 `column_info` 的外键元数据推出来，不写死：数仓加了张维表、或者把外键挪了
+个位置，写死的那份不会报错，只会悄悄 JOIN 错，然后给出一个看着正常的数。
+
+**权限两道，与阶段 9 同构**：拼装前按角色可见范围挑维度、挑指标、挑事实表与关联表
+（下拉框里出现一个选了就 403 的维度，比它干脆不出现更让人困惑）；拼完再拿
+`PermissionScope.violations` 兜底核一遍整句 SQL。前一道覆盖"表与字段"，覆盖不了
+知识库里写歪的口径（比如某个指标的 `calculation` 引用了没登记的字段），所以要第二道。
+拼出来的语句出门前同样过 `assert_readonly`。
+
+有一处与阶段 9 不同：**403 的消息里点名了维度/指标**。那个名字是用户自己请求的，
+不是泄露；不点名他只能靠猜是哪一项被拒了。阶段 9 的不点名针对的是模型自己编出来的
+表名——用户从没见过那个名字。
+
+## 验证清单（阶段 10 验收）
+
+| 验收项 | 方法 |
+|---|---|
+| 能批量导入、删除评测样本 | `pytest tests/test_eval_api.py -v`：一次请求导入多条、逐条删掉、列表随之变化，且删一条不动到另一条；同批重复问题返回 400（重复会把准确率的分母撑大而在结果里看不出来） |
+| 能统计准确率、召回命中率、执行成功率、平均耗时，并落 eval_run | `pytest tests/test_stage10_acceptance.py -v`：跑一遍**真链路**的两条样本，四个指标都要有值，并与库里那一行逐个对齐；判分本身逐条覆盖在 `tests/test_eval_scoring.py`（多重集/列序/浮点噪声/bigint 精度/三条退化路径/召回分母） |
+| 评测看板可看到历史运行趋势 | 同上：连跑两次，`GET /eval/runs` 两条都在且最新的在最前，两条都带着可画图的指标 |
+| 数据看板接口仅 analyst 及以上可访问，viewer 返回 403，且只使用授权范围内表/字段 | `pytest tests/test_dashboard_api.py tests/test_stage10_acceptance.py -v`：viewer 两个端点都 403；只授 `fact_order` + `dim_date` 时，出数 SQL 里只出现这两张表（按 `referenced_tables` 判），按省份看数返回 403，维度下拉框里也没有未授权的维度。拼装规则（口径一致性、`None` 与 `""` 的区别、维度白名单、反引号别名、ORDER BY 用同一表达式）在 `tests/test_dashboard_sql.py` 里用纯函数逐条钉死，不碰数据库 |
+| 评测运行不污染线上数据 | 同上：跑一次评测前后，`conversation` / `message` / `query_history` 三张表的行数一行不差，发起人（admin）的会话数也不变。**这条只能这样验**——隔离做漏时评测照样跑通、指标照样好看，唯一不对的是用户在会话列表里看到自己没问过的问题，而那要等人打开页面才发现 |
+
 ## 目录结构
 
 ```
@@ -692,14 +823,16 @@ data-agent/
 │   ├── retrievers/            dense / fulltext / fusion / candidate + retrieval 网关
 │   ├── clients/               外部连接生命周期管理（MySQL / Qdrant / ES / Redis / LLM / 重排）
 │   ├── repositories/          数据访问层（meta 注入式会话；dw 自开只读连接；
-│   │                          会话、消息、查询历史）
+│   │                          会话、消息、查询历史、评测样本与运行记录）
 │   ├── entities/              领域实体
 │   ├── models/                ORM 模型（阶段 2）
 │   ├── schemas/               请求/响应模型
-│   ├── services/              业务编排
+│   ├── services/              业务编排（含评测执行 eval_runner、看板取数 dashboard_service）
 │   ├── core/                  配置/安全/异常/日志/响应（含 sql_security.py）
 │   └── scripts/               离线脚本（init_admin、build_meta、seed_dw）
-├── evals/                     评测集与评测脚本（阶段 10）
+├── evals/                     预留目录（TDD 3 的规划）。阶段 10 的评测集存在
+│                              `eval_case` 表里、经接口增删，不需要文件形态的评测集，
+│                              所以这里目前只有 .gitkeep
 └── tests/                     单元测试
 ```
 

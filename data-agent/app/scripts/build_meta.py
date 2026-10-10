@@ -152,6 +152,7 @@ def build_mysql_rows(loader: MetaConfigLoader) -> dict[str, list[dict]]:
                 "description": metric.description,
                 "calculation": metric.calculation,
                 "filter_condition": metric.filter_condition,
+                "filter_sql": metric.filter_sql,
                 "time_range": metric.time_range,
                 # Text 列存 id 列表，检索侧解析后回查 column_info
                 "relevant_columns": ",".join(resolved_ids),

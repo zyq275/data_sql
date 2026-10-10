@@ -547,11 +547,11 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
 | GET | /api/v1/eval/cases | admin | 评测集列表 |
 | POST | /api/v1/eval/cases | admin | 批量导入评测样本 |
 | DELETE | /api/v1/eval/cases/{id} | admin | 删除评测样本 |
-| POST | /api/v1/eval/run | admin | 运行评测 |
+| POST | /api/v1/eval/run | admin | 发起评测运行（立刻返回 running 记录，批处理走后台，客户端轮询详情） |
 | GET | /api/v1/eval/runs | admin | 评测运行记录（看板趋势数据） |
-| GET | /api/v1/eval/runs/{id} | admin | 评测运行详情 |
-| GET | /api/v1/dashboard/metrics | analyst | 数据看板指标趋势 |
-| GET | /api/v1/dashboard/dimensions | analyst | 数据看板可用维度 |
+| GET | /api/v1/eval/runs/{id} | admin | 评测运行详情（四个指标 + 逐条明细，也是轮询用的接口） |
+| GET | /api/v1/dashboard/metrics | analyst 及以上 | 数据看板指标趋势（dimension 必填；metrics/start/end 可选） |
+| GET | /api/v1/dashboard/dimensions | analyst 及以上 | 数据看板可用维度与指标（按角色裁剪） |
 | GET | /health | 无 | 存活 |
 | GET | /health/ready | 无 | 就绪 |
 
@@ -561,6 +561,21 @@ Redis 不可用时降级为进程内 `InMemorySaver`：单进程内语义相同�
 > 回答"**算出来是什么**"，与列表接口的"配了什么"不是一回事。两者在三种情况下不一致：
 > 该角色一条都没配（于是不设限）、配的字段已被知识库重建删掉（于是那条权限悬空）、
 > 以及字段级授权把整表收窄了。管理界面同时显示两者才对得上账。
+
+> 评测与看板组（阶段 10 落地时补的说明）：
+>
+> - **`POST /eval/run` 不阻塞**。一次几百条的评测要跑几十分钟，同步等待既过不了网关
+>   超时，也让前端分不清"在跑"与"卡死"。它只写一条 `running` 记录并返回，
+>   批处理交给后台任务；客户端拿 id 去 `GET /eval/runs/{id}` 轮询。
+>   后台任务失败时把记录置为 `failed` 并留下原因，不会永远停在 running。
+> - **看板只接 analyst 及以上**。看板给的是全公司口径的聚合数，不是 viewer 的日常工具。
+> - **看板取数是确定性拼装，不过模型**：聚合表达式取 `metric_info.calculation`、
+>   过滤谓词取 `metric_info.filter_sql`、维度取代码内的白名单。同一个问题两次刷新
+>   必须是同一个数，而经过一次模型生成就给不了这个保证。
+> - **`filter_sql` 是阶段 10 给 `metric_info` 新增的列**（见 8.1 的 DDL 注释）。
+>   原设计里 `filter_condition` 是散文、`calculation` 是聚合表达式，两者都不含可执行的
+>   过滤谓词；而"GMV 只算已支付订单"正是最要紧的那半句口径，缺了它看板与问答报出来的
+>   数会不一样，且两个数都"看着正常"。新增列是加法，`filter_condition` 原样保留。
 
 ### 7.3 SSE 事件协议
 
@@ -706,12 +721,26 @@ CREATE TABLE metric_info (
   metric_alias VARCHAR(128),
   description TEXT,
   calculation TEXT,                    -- 计算逻辑/口径
-  filter_condition TEXT,               -- 过滤规则
+  filter_condition TEXT,               -- 过滤规则（散文，给模型看）
+  filter_sql TEXT,                     -- 过滤谓词的 SQL 形式（阶段 10 新增，见下）
   time_range VARCHAR(128),             -- 时间口径
   relevant_columns TEXT,               -- 相关字段（column_id 列表）
   created_at DATETIME NOT NULL
 );
 ```
+
+> `filter_sql`（阶段 10 新增，可为空）：过滤口径的**可执行谓词形式**，表名限定、
+> 不带 `WHERE` 关键字，例如 `fact_order.order_status = '已支付'`。
+> 它给数据看板拼模板 SQL 用——散文程序读不懂，运行时去解析必然有解析错的那一天，
+> 而错的那天给出的是一个与问答链路口径不一致的数字。
+> `filter_condition` 原样保留：它进提示词与向量文本，是给模型看的口径说明。
+> **两者口径必须一致，但用途不同**，配置里同时写、构建时一并校验
+> （禁止 `;` / `--` / `/*` / `*/`，每处列引用必须带表名限定且确实存在）。
+> **没写 `filter_sql`（`None`）的指标不上看板**：看板会拒绝它并说明原因，而不是按
+> 不过滤出数——后者给出的是一个与问答链路口径不一致的数字，而它看着完全正常，
+> 两个数都"正常"时没有人会去对账。**确实不需要过滤的指标写 `filter_sql: ""` 明说**，
+> 与"忘了写"区分开：`""` 是想清楚了，`None` 是漏写。同一次查询里所有指标必须共用
+> 同一份口径（`""` 与真实谓词混用也算不一致，那等于把谓词放开了）。
 
 **column_metric**
 
@@ -884,6 +913,10 @@ CREATE TABLE fact_order (
 
 - 字段：`别名（字段名）。所属表：<表别名>。<描述>[。外键，关联 x.y]`
 - 指标：`别名（指标名）。<描述>。计算方式：<calculation>。过滤条件：<filter_condition>`
+
+> `filter_sql` **不进这段文本**：它是同一条口径的机器可读形式，与 `filter_condition`
+> 说的是同一件事，一起拼进去只是把同一句话对检索侧说两遍（一遍中文、一遍 SQL），
+> 反而让向量偏向写法。看板取数直接从 `metric_info` 行里读它（见 7.2 的说明）。
 
 别名放在最前，因为用户问的是"订单金额"而不是 `order_amount`。这段文本**原样**
 存进 Qdrant payload 的 `text` 与 ES 文档的 `text`（字段索引的取值文本为

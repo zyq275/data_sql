@@ -15,6 +15,13 @@
 #                                 生成 SQL 时必须严格遵循（BR-META-002）
 #     .relevant_columns           相关字段名，构建时解析为 column_id 写入 metric_info.relevant_columns
 #                                 与 column_metric 关联表
+#     .filter_sql                 过滤口径的 **SQL 谓词形式**（表名限定，不带 WHERE 关键字），
+#                                 供阶段 10 的数据看板拼模板 SQL 用——看板不能执行散文。
+#                                 filter_condition 仍是给模型看的口径说明，两者并存、口径必须一致：
+#                                 前者进提示词与向量文本，后者进 SELECT 的 WHERE 子句。
+#                                 不写这个键 = 该指标不上看板（看板会拒绝并说明原因，而不是
+#                                 按不过滤出数——那会给出一个与问答链路不一致却看着正常的数字）；
+#                                 确实不过滤的指标写 `filter_sql: ""` 明说。
 #
 # 表结构必须与 app/scripts/seed_dw.py 建出的 DDL 一致（TDD 8.2）。
 
@@ -183,6 +190,7 @@ metrics:
     description: 一定周期内已支付订单的成交金额合计（口语常称销售额、营收、卖了多少钱），是衡量销售规模的核心指标
     calculation: SUM(fact_order.order_amount)
     filter_condition: 仅统计 order_status = '已支付' 的订单，排除已取消与已退款
+    filter_sql: fact_order.order_status = '已支付'
     time_range: 按 dim_date.year / quarter / month 聚合
     relevant_columns: [order_amount, order_status, date_id]
 
@@ -191,6 +199,7 @@ metrics:
     description: 一定周期内的订单笔数，同一订单号只计一次
     calculation: COUNT(DISTINCT fact_order.order_id)
     filter_condition: 仅统计 order_status = '已支付' 的订单
+    filter_sql: fact_order.order_status = '已支付'
     time_range: 按 dim_date.year / quarter / month 聚合
     relevant_columns: [order_id, order_status, date_id]
 
@@ -199,6 +208,7 @@ metrics:
     description: 一定周期内售出的商品件数合计（口语常称销量、卖了多少件、出货件数），用于衡量出货规模
     calculation: SUM(fact_order.order_quantity)
     filter_condition: 仅统计 order_status = '已支付' 的订单
+    filter_sql: fact_order.order_status = '已支付'
     time_range: 按 dim_date.year / quarter / month 聚合
     relevant_columns: [order_quantity, order_status, date_id]
 
@@ -207,6 +217,7 @@ metrics:
     description: 平均每笔订单的成交金额，反映客户的单次消费能力
     calculation: SUM(fact_order.order_amount) / COUNT(DISTINCT fact_order.order_id)
     filter_condition: 仅统计 order_status = '已支付' 的订单，分母为订单笔数而非商品行数
+    filter_sql: fact_order.order_status = '已支付'
     time_range: 按 dim_date.year / quarter / month 聚合
     relevant_columns: [order_amount, order_id, order_status, date_id]
 
@@ -215,5 +226,6 @@ metrics:
     description: 一定周期内产生过已支付订单的去重客户数，用于衡量用户活跃度
     calculation: COUNT(DISTINCT fact_order.customer_id)
     filter_condition: 仅统计 order_status = '已支付' 的订单，同一客户多笔订单只计一次
+    filter_sql: fact_order.order_status = '已支付'
     time_range: 按 dim_date.year / quarter / month 聚合
     relevant_columns: [customer_id, order_status, date_id]

@@ -68,6 +68,12 @@ class MetricInfo(Base):
     description: Mapped[str | None] = mapped_column(Text)
     calculation: Mapped[str | None] = mapped_column(Text)
     filter_condition: Mapped[str | None] = mapped_column(Text)
+    filter_sql: Mapped[str | None] = mapped_column(Text)
+    """过滤口径的 SQL 谓词形式（阶段 10 起）。
+
+    与 ``filter_condition`` 并存：那条是给模型读的口径说明，这条是给看板拼进
+    WHERE 子句的谓词。看板走模板 SQL，没有"读懂散文"这一步，所以两者不能合并。
+    """
     time_range: Mapped[str | None] = mapped_column(String(128))
     relevant_columns: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)

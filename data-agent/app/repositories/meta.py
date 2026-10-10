@@ -71,6 +71,29 @@ class MetaRepository:
         result = await self.session.execute(select(ColumnInfo).order_by(ColumnInfo.id))
         return result.scalars().all()
 
+    async def column_metrics(self) -> Sequence[ColumnMetric]:
+        """全部"字段-指标"关联（按 metric_id 排序）。
+
+        供阶段 10 的数据看板用：指标碰了哪些表，由这张关联表回答，
+        而不是去解析 ``calculation`` 的 SQL 文本——关联表是知识库自己的声明，
+        而文本解析只认得 FROM 子句里的表（``SUM(fact_order.order_amount)``
+        里的 fact_order 出现在字段限定位置上，解析不出来）。
+        """
+        result = await self.session.execute(
+            select(ColumnMetric).order_by(ColumnMetric.metric_id, ColumnMetric.column_id)
+        )
+        return result.scalars().all()
+
+    async def metrics(self) -> Sequence[MetricInfo]:
+        """全部指标定义（按 id 排序）。
+
+        供阶段 10 的数据看板用：它要拿 ``calculation`` 当聚合表达式、``filter_sql``
+        当过滤谓词去拼模板 SQL，两样都在这一行里。判权仍走 ``agent.permissions``
+        那个网关，这里只提供事实。
+        """
+        result = await self.session.execute(select(MetricInfo).order_by(MetricInfo.id))
+        return result.scalars().all()
+
     async def counts(self) -> dict[str, int]:
         """各表行数，用于构建后的入库自检。"""
         out: dict[str, int] = {}

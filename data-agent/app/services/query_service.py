@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -123,7 +123,13 @@ class QueryService:
         )
 
     async def stream(
-        self, query: str, *, user_id: str, role: str = "viewer", turn: TurnContext
+        self,
+        query: str,
+        *,
+        user_id: str,
+        role: str = "viewer",
+        turn: TurnContext,
+        on_state: Callable[[QueryState], None] | None = None,
     ) -> AsyncIterator[dict]:
         """跑一遍图，逐个产出事件字典（SSE 帧的编码交给接口层）。
 
@@ -133,6 +139,13 @@ class QueryService:
         ``role`` 用于算数据权限（阶段 9）。默认值只服务于单测与评测干跑，
         真实入口（api/v1/query）显式传 ``user.role``——权限是安全边界，
         不该依赖一个"忘了传也不会报错"的默认值。
+
+        ``on_state`` 每拿到一份状态快照就被调用一次，**最后一份就是图终态**
+        （调用方自己留最后一份即可，如评测里的 ``states.append``）。
+        加它是因为**评测需要图终态、而终态不在事件里**：``table_infos`` 那类"召回到了
+        哪些表"的事实只存在于状态中，事件流里只有模型看得到的那部分产出。做成回调
+        而不是"跑完返回终态"，是因为事件必须边跑边推——把它们攒到最后再一起给，
+        SSE 的进度条就失效了。默认 None 时行为与从前完全一致。
         """
         started = time.perf_counter()
         session_id = turn.conversation.id if turn.conversation else None
@@ -158,6 +171,8 @@ class QueryService:
                     yield chunk
                 else:
                     final = chunk
+                    if on_state is not None:
+                        on_state(chunk)
         except AppException as exc:
             # 业务异常：message 已经是给人看的（约定见 core.exceptions），原样透出
             logger.info("问答中断（%s）：%s", exc.code, exc)
@@ -287,20 +302,27 @@ class QueryService:
 
     @staticmethod
     def _gave_up(state: QueryState) -> dict:
-        """把"图带着错误停下来"变成一条明确的 error 事件。
+        """把"图带着错误停下来"变成一条明确的 error 事件（见模块级 ``gave_up``）。"""
+        return gave_up(state)
 
-        带上最后一次的校验原因，而不是只说"失败了"：用户据此能判断是自己问得
-        含糊，还是库里压根没有这个字段——前者改问法，后者找数据团队，
-        两种处置完全不同，而笼统的失败提示把判断成本全部推给了用户。
-        同时点明已重试次数，让"又失败"和"再试一次也许能过"区分得开。
-        """
-        return {
-            "type": ERROR,
-            "code": state.get("error_code") or ServiceError.code,
-            "message": (
-                f"SQL 连续校正 {MAX_SQL_CORRECTIONS} 次仍未通过：{state['error']}"
-            ),
-        }
+
+def gave_up(state: QueryState) -> dict:
+    """把"图带着错误停下来"变成一条明确的 error 事件。
+
+    带上最后一次的校验原因，而不是只说"失败了"：用户据此能判断是自己问得
+    含糊，还是库里压根没有这个字段——前者改问法，后者找数据团队，
+    两种处置完全不同，而笼统的失败提示把判断成本全部推给了用户。
+    同时点明已重试次数，让"又失败"和"再试一次也许能过"区分得开。
+
+    模块级函数而不仅是服务层的方法：评测（阶段 10）也要用它把一次失败的样本
+    描述成同一种说法，否则评测明细里的失败原因与线上返回给用户的是两套措辞，
+    对照起来还要人肉翻译。
+    """
+    return {
+        "type": ERROR,
+        "code": state.get("error_code") or ServiceError.code,
+        "message": (f"SQL 连续校正 {MAX_SQL_CORRECTIONS} 次仍未通过：{state['error']}"),
+    }
 
 
 class _Trace:
