@@ -60,6 +60,23 @@ a {
   border: 1px solid var(--da-color-border-light);
   border-radius: var(--da-radius-lg);
   box-shadow: var(--da-shadow-sm);
+  /* 过渡挂在基类上而不是 --interactive 上：悬停结束时也要平滑地退回去，
+     只写在 :hover 里的话，进入有动画、退出是瞬变，看着像卡了一下 */
+  transition:
+    border-color var(--da-duration-base) var(--da-ease-out),
+    box-shadow var(--da-duration-base) var(--da-ease-out),
+    transform var(--da-duration-base) var(--da-ease-out);
+}
+
+/*
+ * 可悬停的卡片。**必须显式加这个类，不做"所有卡片一律抬起"**：
+ * 抬起是"这里可以点/可以操作"的承诺，而筛选栏、展示区这类卡片点上去什么都不会发生。
+ * 给了不该给的反馈，比不给更糟——用户会去点它，然后以为系统坏了。
+ */
+.da-card--interactive:hover {
+  border-color: var(--da-color-primary-light-5);
+  box-shadow: var(--da-shadow-hover);
+  transform: translateY(var(--da-hover-lift));
 }
 
 /* ---- 页面骨架 ---- */
@@ -129,4 +146,86 @@ a {
 .da-fade-enter-from,
 .da-fade-leave-to {
   opacity: 0;
+}
+
+/*
+ * ---- 键盘焦点 ----
+ *
+ * 改造前这里一条都没有：鼠标用户点得到，键盘用户 Tab 过去**看不出焦点在哪**。
+ * 浏览器默认的 outline 在这套浅色底上极不显眼，多数页面又把它清了。
+ *
+ * 用 `:focus-visible` 而不是 `:focus`：`:focus` 在鼠标点击时也会亮，
+ * 于是每次点按钮都闪一圈光圈，很吵；`:focus-visible` 只在"浏览器认为用户在
+ * 用键盘"时才亮，正好是需要的语义。
+ *
+ * 只列我们自己会拿到焦点的元素，**不写成 `*:focus-visible`**：EP 的输入框、
+ * 下拉框自带焦点样式，而且它们的"边框"就是 box-shadow——再叠一层光圈会把
+ * 边框替换掉，看起来像输入框被点亮了。
+ *
+ * 这里**不设 border-radius**：光圈的外形是跟着元素自己的圆角走的，
+ * 写死一个值的话，EP 的按钮（圆角 md）一被 Tab 到就会当场缩成 sm，
+ * 松手再弹回去——看起来像按钮在抖。
+ */
+a:focus-visible,
+button:focus-visible,
+[role='button']:focus-visible,
+.el-button:focus-visible,
+.el-menu-item:focus-visible,
+.el-tabs__item:focus-visible,
+.el-dropdown:focus-visible {
+  outline: none;
+  box-shadow: var(--da-focus-ring);
+}
+
+/* ---- 工具类 ---- */
+/* 表格与 KPI 里的数字：等宽数字让上下两行的位数对齐，
+   不然 1 和 8 占的宽度不同，一列数字的右边缘是锯齿状的 */
+.da-num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* 整行可点的表格、整块可点的卡片用它声明"我能点"，
+   光标是最廉价也最直接的暗示（HistoryView 的行点击用的就是它） */
+.da-clickable {
+  cursor: pointer;
+}
+
+/*
+ * ---- 尊重系统的"减少动态效果" ----
+ *
+ * 前庭功能敏感的用户会在系统里把动效关掉（Windows 的"显示动画"、
+ * macOS 的"减弱动态效果"），浏览器据此把 prefers-reduced-motion 置为 reduce。
+ * 我们所有的悬停位移、底色过渡都在这条偏好之下，不接管的话就是不理会这个设置。
+ *
+ * 压到 0.01ms 而不是把 transition/animation 直接设为 none：设成 none 会让
+ * 依赖 transitionend 事件的代码收不到回调（本项目的路由过渡就是靠 CSS 过渡，
+ * 虽然这里没监听它），保留一个近乎瞬时的时长能让两边都成立。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .da-card--interactive:hover {
+    transform: none;
+  }
+
+  /*
+   * 例外：加载指示器的转圈。
+   *
+   * 上面那条把**所有**动画压成了 0.01ms，EP 按钮内的加载图标（`.el-icon.is-loading`）
+   * 于是冻在一帧上——按钮看起来跟卡死没有区别，而"在跑还是卡住了"恰恰是它要传达的
+   * 唯一信息。减少动效针对的是装饰性位移，不是状态指示，所以这里单独放行。
+   */
+  .el-icon.is-loading,
+  .el-loading-spinner .circular {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
 }

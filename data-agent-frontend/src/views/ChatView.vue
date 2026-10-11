@@ -84,6 +84,16 @@ const streaming = ref(false)
 
 const scrollBox = ref<HTMLDivElement | null>(null)
 let controller: AbortController | null = null
+
+/**
+ * 这一轮是不是**我们自己**中止的（点"停止生成"、切换会话、登出）。
+ *
+ * 只为一件事存在：判断刷新中断的痕迹该不该擦（见 send() 的 finally）。
+ * 页面刷新时浏览器会自己掐断那条 fetch，失败同样以 `QueryAbortedError` 冒出来——
+ * 但那意味着"这一轮死在了刷新上"，恰恰是留给下次加载去提示的，痕迹绝不能擦。
+ * 光看异常类型分不出这两个来源，只能靠"是不是我们按的开关"。
+ */
+let abortedByUs = false
 let turnSeq = 0
 
 const currentTurn = computed(() => {
@@ -124,7 +134,12 @@ function newTurn(questionText: string): Turn {
     steps: [],
     done: null,
     streaming: true,
-    createdAt: null,
+    // 现场提问这一侧的"提问时间"只能自己取：后端那条 created_at 要等这一轮
+    // 跑完落库才存在，而这一问发出去的那一刻就该看得见时间——等到有结果才显示
+    // 的话，一个跑了两分钟才失败的提问会永远没有时间。
+    // 取 ISO 串（带 Z）与后端给的裸本地串形状不同，但都能被 formatDateTime
+    // 还原成同一个墙上时间，页面上看不出差别。
+    createdAt: new Date().toISOString(),
   })
 }
 
@@ -232,6 +247,9 @@ async function removeConversation(item: ConversationOut) {
 }
 
 function abortStreaming() {
+  if (controller) {
+    abortedByUs = true
+  }
   controller?.abort()
   controller = null
   streaming.value = false
@@ -251,6 +269,7 @@ async function send() {
   }
 
   let conversationId = activeId.value
+  let finishedCleanly = false
   const turn = newTurn(text)
   turns.value.push(turn)
   question.value = ''
@@ -268,6 +287,8 @@ async function send() {
     }
 
     controller = new AbortController()
+    // 从这一刻起才算"正在流"，中止标志也只对这一段有意义
+    abortedByUs = false
     // 留痕见 utils/inflight：这一轮要是死在刷新上（上下文销毁，下面的 finally
     // 跑不到），下次加载就靠它才知道刚才有一轮没跑完
     markInflight({ conversationId, question: text })
@@ -298,8 +319,12 @@ async function send() {
       },
       controller.signal,
     )
+    finishedCleanly = true
   } catch (error) {
     if (error instanceof QueryAbortedError) {
+      // 走到这里的中止有两种来源：用户自己按的停止（abortStreaming 会置
+      // abortedByUs），和**页面被刷新/关闭时浏览器掐断的**。两者在这里长得
+      // 一模一样，分辨的责任交给 finally（见那里的说明）。
       // 用户主动取消不算失败，但要说清楚这一轮没跑完——否则它看起来像一次
       // 没有结果的正常回答
       turn.error = { code: 0, message: '已取消本次查询' }
@@ -310,10 +335,22 @@ async function send() {
       }
     }
   } finally {
-    // 能走到这里就说明页面还活着（成功、报错、用户自己点了停止生成都在内），
-    // 那一轮的去向用户已经看见了，不必在下次加载时再提一次。
-    // 刷新时走不到这里——这正是留痕能当作"死于刷新"判据的原因。
-    clearInflight()
+    // 擦痕迹只认两件**能确定的事**：这一轮自己跑完了（`done` 到了才会走到
+    // `finishedCleanly = true` 那行），或中止是我们自己按的（abortedByUs）。
+    //
+    // 反过来说：**不拿"异常长什么样"当判据**。早先这里无条件 clearInflight()，
+    // 依据是"刷新时走不到 finally"——这个前提不成立：刷新时浏览器掐断那条 fetch，
+    // 失败会被上面的 catch 接住，V8 完全可能在被销毁前把它排完，于是 finally
+    // 照跑、痕迹被擦、提示再也出不来。而"那条失败是不是 AbortError"也不可靠：
+    // 掐断的连接可能抛 AbortError，也可能抛成别的样子，掉进 catch 的 else 分支
+    // 照样会擦。所以判据换成这里两件与浏览器时序无关的事实。
+    //
+    // 代价是极少数情况下会多留一次痕迹（比如后端挂了、用户看见报错后刷新），
+    // 下次加载会多弹一次提示；但那时这一轮**确实**没落库，提示说的不是假话。
+    // 反过来漏留的代价是问题永远不再被提起，那就没法补了。
+    if (finishedCleanly || abortedByUs) {
+      clearInflight()
+    }
     turn.streaming = false
     streaming.value = false
     controller = null
@@ -347,8 +384,8 @@ function retry(turn: Turn) {
 /**
  * 刷新把上一轮掐断之后的善后：告诉用户那一轮没了，并给一次重跑的机会。
  *
- * 判据与理由见 `utils/inflight`——痕迹在=上次提问死于刷新，痕迹被擦掉=上一轮
- * 的去向用户已经看见过了（成功、报错、或自己点了停止生成）。
+ * 判据与理由见 `utils/inflight`——痕迹在=上次提问没有善终（多半是死于刷新），
+ * 痕迹被擦掉=这一轮跑完了、或者中止是我们自己按的（见 `send` 的 finally）。
  *
  * 提示里必须说清"没有保存"：后端中断时连落库都来不及做（落库在流跑完之后），
  * 所以历史里查不到这一轮。不说的话，用户会自己去历史里翻，然后怀疑是不是看漏了。
@@ -359,6 +396,11 @@ async function promptInterrupted() {
     return
   }
   const questionText = lost.question.trim()
+  // 会话里已经有这句提问，说明那一轮其实跑完并落了库（刷新恰好落在收尾那一刻，
+  // 痕迹来不及擦）。结果就在眼前，再问一次"要不要重新提问"只会让人以为它丢了
+  if (turns.value.some((item) => item.question.trim() === questionText)) {
+    return
+  }
   const excerpt = questionText.length > 30 ? `${questionText.slice(0, 30)}…` : questionText
   try {
     await ElMessageBox.confirm(
@@ -379,10 +421,16 @@ async function promptInterrupted() {
 }
 
 onMounted(async () => {
-  await loadConversations()
-  const id = route.params.conversationId
-  if (typeof id === 'string' && id) {
-    await openConversation(id)
+  // 载入失败（列表拉不到、会话已被删）不该把这个提示一起吃掉：那一轮的结果本来
+  // 就没保存，这次提示是用户唯一的线索，比会话列表重不重要得多
+  try {
+    await loadConversations()
+    const id = route.params.conversationId
+    if (typeof id === 'string' && id) {
+      await openConversation(id)
+    }
+  } catch {
+    // 见上：吞掉，继续去弹提示
   }
   // 放在载入会话之后：提示里的"重新提问"要接着这一轮的上下文发出去
   await promptInterrupted()
@@ -465,6 +513,11 @@ onBeforeUnmount(abortStreaming)
             <div class="turn__question">
               <span class="turn__badge">问</span>
               <p class="turn__question-text">{{ turn.question }}</p>
+              <!-- 提问时间靠右挂在问题这一行上：一轮的问题、SQL、结果、解读是一大块，
+                   时间要跟"问的是哪一句"绑在一起，落到块首或块尾都会看不出属于谁 -->
+              <time v-if="turn.createdAt" class="turn__time">
+                {{ formatDateTime(turn.createdAt) }}
+              </time>
             </div>
 
             <!-- 进度：流式期间逐格点亮，结束后收起成一行摘要。
@@ -472,8 +525,10 @@ onBeforeUnmount(abortStreaming)
                  正是事后复盘要看的，而它只在流式那一刻存在过就太可惜了 -->
             <div v-if="turn.steps.length" class="turn__progress">
               <template v-if="turn.streaming">
-                <el-icon class="turn__spin"><Refresh /></el-icon>
-                <span class="da-text-sm">正在{{ runningStep || '处理' }}…</span>
+                <div class="turn__running">
+                  <span class="turn__pulse" aria-hidden="true" />
+                  <span class="da-text-sm">正在{{ runningStep || '处理' }}…</span>
+                </div>
               </template>
               <span v-else class="da-text-sm da-text-secondary">
                 已完成 {{ orderedSteps(turn).length }} 个步骤<template v-if="turn.done?.correction_count">
@@ -611,15 +666,31 @@ onBeforeUnmount(abortStreaming)
   padding: var(--da-space-2) var(--da-space-2);
   border-radius: var(--da-radius-md);
   cursor: pointer;
-  transition: background var(--da-transition);
+  transition: background-color var(--da-duration-fast) var(--da-ease-out);
 }
 
 .chat__session-item:hover {
   background: var(--da-color-bg-hover);
 }
 
+/* 选中态与左侧导航同一套语言（浅底 + 主色竖条），
+   这样"当前在哪"在两个列表里的读法是同一个。竖条画在 8px 的内边距里，
+   不挤动文字——用加内边距来让位的话，选中时标题会横向跳一下。 */
 .chat__session-item--active {
+  position: relative;
   background: var(--da-color-primary-light-9);
+}
+
+.chat__session-item--active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2px;
+  height: 16px;
+  border-radius: var(--da-radius-pill);
+  background: var(--da-color-primary);
 }
 
 .chat__session-main {
@@ -641,12 +712,18 @@ onBeforeUnmount(abortStreaming)
   color: var(--da-color-text-placeholder);
 }
 
+/* 删除按钮平时藏着（它挂在每一行上，全亮出来会让列表看起来全是删除键），
+   悬停才现身。`transition` 挂在常态上，移开鼠标时是淡出而不是瞬间消失。
+   `:focus-within` 那一条是给键盘用户的：Tab 能够到按钮，但够到的时候
+   它还是 opacity: 0 —— 焦点落在了一个看不见的东西上。 */
 .chat__session-delete {
   opacity: 0;
   color: var(--da-color-text-secondary);
+  transition: opacity var(--da-duration-fast) var(--da-ease-out);
 }
 
-.chat__session-item:hover .chat__session-delete {
+.chat__session-item:hover .chat__session-delete,
+.chat__session-item:focus-within .chat__session-delete {
   opacity: 1;
 }
 
@@ -704,6 +781,15 @@ onBeforeUnmount(abortStreaming)
   line-height: var(--da-line-height-tight);
 }
 
+.turn__time {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding-top: 3px;
+  font-size: var(--da-font-xs);
+  color: var(--da-color-text-placeholder);
+  white-space: nowrap;
+}
+
 .turn__progress {
   display: flex;
   flex-direction: column;
@@ -719,14 +805,39 @@ onBeforeUnmount(abortStreaming)
   gap: var(--da-space-1);
 }
 
-.turn__spin {
-  animation: turn-spin 1.2s linear infinite;
-  color: var(--da-color-primary);
+/*
+ * 流式进行中的指示：一个脉动的小圆点。
+ *
+ * 原本这里是一个旋转的 Refresh 图标，而且因为 `.turn__progress` 是纵向 flex，
+ * 它孤零零占了一整行，把"正在检索…"这行字压到了第二行。
+ * 改成圆点并和文字并排：点的大小和行内文字相当，脉动只改透明度与缩放，
+ * 占位不变——如果做成缩放一个 22px 的图形，行高会跟着一起跳。
+ */
+.turn__running {
+  display: flex;
+  align-items: center;
+  gap: var(--da-space-2);
 }
 
-@keyframes turn-spin {
-  to {
-    transform: rotate(360deg);
+.turn__pulse {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: var(--da-radius-pill);
+  background: var(--da-color-primary);
+  animation: turn-pulse 1.2s var(--da-ease-out) infinite;
+}
+
+@keyframes turn-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.35;
+    transform: scale(0.72);
   }
 }
 

@@ -27,6 +27,9 @@
   --da-color-primary-light-8: #d6dffe;
   --da-color-primary-light-9: #eaefff;
   --da-color-primary-rgb: 49, 94, 251;
+  /* 浅色这一档的 rgb 分量：给"同色相、要调透明度"的用法（登录页左栏的极光层）。
+     写死 rgba(110,142,252,…) 的话，改主色时这一处会漏改——页面里只写 var()。 */
+  --da-color-primary-light-3-rgb: 110, 142, 252;
 
   --da-color-success: #17a673;
   --da-color-warning: #d98f00;
@@ -61,10 +64,34 @@
   --da-radius-lg: 12px;
   --da-radius-pill: 999px;
 
-  /* ---- 阴影 ---- */
+  /* ---- 阴影 ----
+   * hover 那一档介于 sm 与 md 之间，专供"鼠标停在可点区域上"用：卡片平时是 sm，
+   * 悬停时抬到 hover。**不直接跳 md** —— md 是弹层/抽屉的量级，卡片用上它，
+   * 一屏卡片同时悬停时页面会显得在浮，而实际上什么都没发生。 */
   --da-shadow-sm: 0 1px 2px rgba(23, 33, 56, 0.06);
+  --da-shadow-hover: 0 6px 20px rgba(23, 33, 56, 0.1);
   --da-shadow-md: 0 4px 16px rgba(23, 33, 56, 0.08);
   --da-shadow-lg: 0 12px 32px rgba(23, 33, 56, 0.12);
+
+  /* ---- 交互与动效 ----
+   * 三个时长各有用处，不是同一条曲线的三个刻度：
+   *   fast —— 颜色/底色这类"眼睛几乎不追踪"的变化，慢了会显得拖；
+   *   base —— 边框、阴影、位移，150-200ms 是人能感到"顺"而察觉不到"在播动画"的区间；
+   *   slow —— 展开/收起这类改变尺寸的变化，快了会让人丢失"它去哪儿了"的空间感。
+   *
+   * 抬升量固定 2px：这是"可点"的最小可感信号。再大就成了跳跃，一屏卡片里
+   * 会显得页面自己在动（本次改造刻意不做入场动效，位移只允许出现在反馈里）。 */
+  --da-duration-fast: 0.15s;
+  --da-duration-base: 0.2s;
+  --da-duration-slow: 0.3s;
+  --da-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --da-hover-lift: -2px;
+
+  /* 键盘焦点的光圈。键盘用户靠它知道"现在按下去会作用在谁身上"，
+   * 而浏览器默认的 outline 在这套浅色底上几乎看不见。
+   * 用主色的 rgb 分量而不是再写一遍色值：改主色时这里不会漏改。 */
+  --da-focus-ring: 0 0 0 3px rgba(var(--da-color-primary-rgb), 0.28);
+  --da-focus-ring-danger: 0 0 0 3px rgba(229, 72, 77, 0.28);
 
   /* ---- 字号 ---- */
   --da-font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial,
@@ -102,6 +129,9 @@
   --da-chart-3: #d98f00;
   --da-chart-4: #7c5cff;
   --da-chart-5: #12a5b8;
+  /* 同上：需要半透明版本时用这两个分量，不复制色值 */
+  --da-chart-4-rgb: 124, 92, 255;
+  --da-chart-5-rgb: 18, 165, 184;
   --da-chart-6: #e5484d;
 
   /* ---- 骨架尺寸 ---- */
@@ -152,4 +182,17 @@
 
   --el-box-shadow-light: var(--da-shadow-sm);
   --el-box-shadow: var(--da-shadow-md);
+
+  /* 表格的悬停底色与表头底色。
+   * 走变量而不是去覆盖 `.el-table__row:hover` 那个类名：类名会随 EP 版本升级而失效，
+   * 失效的表现是"悬停又变回灰的了"，不会报错，只会悄悄退化。
+   * 悬停取主色的最浅一档（light-9）而不是灰色——它把"鼠标停在这一行"和
+   * 斑马纹的灰区分开，长表格里不容易看错行。 */
+  --el-table-row-hover-bg-color: var(--da-color-primary-light-9);
+  --el-table-header-bg-color: var(--da-color-bg-soft);
+
+  /* EP 自己的过渡时长也接过来，否则会出现"我们的卡片 200ms、EP 的下拉 300ms" */
+  --el-transition-duration: var(--da-duration-base);
+  --el-transition-duration-fast: var(--da-duration-fast);
+  --el-transition-function-ease-in-out-bezier: var(--da-ease-out);
 }

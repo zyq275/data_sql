@@ -222,7 +222,8 @@ function handleCommand(command: string) {
   flex-direction: column;
   background: var(--da-color-bg-card);
   border-right: 1px solid var(--da-color-border-light);
-  transition: width var(--da-transition);
+  /* 折叠是"改变尺寸"那一档，用 slow；跟颜色类反馈的 fast/base 分开 */
+  transition: width var(--da-duration-slow) var(--da-ease-out);
   overflow: hidden;
 }
 
@@ -243,9 +244,10 @@ function handleCommand(command: string) {
   height: 28px;
   flex: 0 0 auto;
   border-radius: var(--da-radius-sm);
-  background: var(--da-color-primary);
+  background: linear-gradient(135deg, var(--da-color-primary), var(--da-color-primary-active));
   color: var(--da-color-text-inverse);
   font-weight: 600;
+  box-shadow: var(--da-shadow-sm);
 }
 
 .brand__text {
@@ -258,6 +260,58 @@ function handleCommand(command: string) {
   border-right: none;
   flex: 1 1 auto;
   overflow-y: auto;
+  /* 悬停底色与选中文字色都走 EP 暴露的变量（不覆盖它的类名，理由见 tokens.css）。
+   *
+   * 悬停底色**刻意偏离** EP 的默认值：它默认也是 `--el-color-primary-light-9`，
+   * 和下面选中的底色一模一样——鼠标划过某一项时，那一项看起来"被选中了"。
+   * 悬停用中性灰，选中才用主色，两种状态才分得开。 */
+  --el-menu-hover-bg-color: var(--da-color-bg-hover);
+  --el-menu-active-color: var(--da-color-primary);
+}
+
+/*
+ * 菜单项做成圆角胶囊 + 选中指示条。
+ *
+ * EP 的垂直菜单默认只在选中项上改**文字颜色**，一列灰字里那点蓝很弱，
+ * 切页面时"我现在在哪"要靠仔细看才认得出来。而 EP 没有暴露"选中项背景"的变量
+ * （`--el-menu-active-color` 只管文字色），所以这一处只能落到它的类名上。
+ */
+.layout__menu :deep(.el-menu-item) {
+  height: 40px;
+  line-height: 40px;
+  margin: 2px var(--da-space-2);
+  border-radius: var(--da-radius-md);
+  transition:
+    background-color var(--da-duration-fast) var(--da-ease-out),
+    color var(--da-duration-fast) var(--da-ease-out);
+}
+
+.layout__menu :deep(.el-menu-item.is-active) {
+  position: relative;
+  background: var(--da-color-primary-light-9);
+  font-weight: 600;
+}
+
+/* 指示条独立于底色：底色在浅色屏上可能被看漏，一条实心竖条不会。
+   折叠态（64px 宽）下它没有容身之处，直接隐藏。 */
+.layout__menu :deep(.el-menu-item.is-active)::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 18px;
+  border-radius: var(--da-radius-pill);
+  background: var(--da-color-primary);
+}
+
+.layout__menu.el-menu--collapse :deep(.el-menu-item.is-active)::before {
+  display: none;
+}
+
+.layout__menu.el-menu--collapse :deep(.el-menu-item) {
+  margin: 2px var(--da-space-1);
 }
 
 .layout__group {
@@ -283,8 +337,22 @@ function handleCommand(command: string) {
   gap: var(--da-space-2);
 }
 
+/* 折叠按钮：EP 的 link 按钮默认只改文字色，鼠标停上去几乎没反应。
+ * 给它一块方形底色，让它看起来是一个"按钮"而不是一行灰字。 */
 .layout__collapse {
+  width: 30px;
+  height: 30px;
+  padding: 0;
   color: var(--da-color-text-secondary);
+  border-radius: var(--da-radius-sm);
+  transition:
+    color var(--da-duration-fast) var(--da-ease-out),
+    background-color var(--da-duration-fast) var(--da-ease-out);
+}
+
+.layout__collapse:hover {
+  color: var(--da-color-primary);
+  background-color: var(--da-color-bg-hover);
 }
 
 .layout__title {
@@ -292,6 +360,8 @@ function handleCommand(command: string) {
   font-weight: 600;
 }
 
+/* 用户区整块是一个下拉触发器，但视觉上它只是一排字，看不出可以点。
+ * 补一圈悬停底色（胶囊形），点与不点的界线就有了。 */
 .layout__user {
   display: flex;
   align-items: center;
@@ -299,6 +369,13 @@ function handleCommand(command: string) {
   cursor: pointer;
   outline: none;
   color: var(--da-color-text-regular);
+  padding: var(--da-space-1) var(--da-space-2);
+  border-radius: var(--da-radius-pill);
+  transition: background-color var(--da-duration-fast) var(--da-ease-out);
+}
+
+.layout__user:hover {
+  background-color: var(--da-color-bg-hover);
 }
 
 .layout__avatar {

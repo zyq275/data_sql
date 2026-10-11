@@ -263,11 +263,14 @@ onMounted(load)
 </template>
 
 <style scoped>
+/* 允许换行：搜索框定宽 320px，窗口一窄就会把两个按钮挤出卡片外
+   （历史页那一条筛选栏已经这么写了，这里跟上） */
 .users__filters {
   display: flex;
   align-items: center;
   gap: var(--da-space-3);
   padding: var(--da-space-4);
+  flex-wrap: wrap;
 }
 
 .users__keyword {

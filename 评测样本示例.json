@@ -1,0 +1,27 @@
+[
+  {
+    "query_text": "华东大区一共有多少个省份？",
+    "expected_sql": "SELECT COUNT(dim_region.province) FROM dim_region WHERE dim_region.region_name = '华东'",
+    "expected_result": { "columns": ["省份数"], "rows": [[7]] }
+  },
+  {
+    "query_text": "日期表里一共有多少天？",
+    "expected_sql": "SELECT COUNT(*) FROM dim_date",
+    "expected_result": { "columns": ["天数"], "rows": [[1012]] }
+  },
+  {
+    "query_text": "日期表覆盖了哪些年份？",
+    "expected_sql": "SELECT DISTINCT dim_date.year FROM dim_date",
+    "expected_result": { "columns": ["年份"], "rows": [[2024], [2025], [2026]] }
+  },
+  {
+    "query_text": "平台上一共有几种商品品类？",
+    "expected_sql": "SELECT COUNT(DISTINCT dim_product.category) FROM dim_product",
+    "expected_result": { "columns": ["品类数"], "rows": [[7]] }
+  },
+  {
+    "query_text": "会员等级一共有几档？",
+    "expected_sql": "SELECT COUNT(DISTINCT dim_customer.member_level) FROM dim_customer",
+    "expected_result": { "columns": ["档数"], "rows": [[4]] }
+  }
+]

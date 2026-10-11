@@ -296,7 +296,7 @@ onBeforeUnmount(clearPoll)
           description="还没有运行记录"
           hint="先在「评测集」导入样本，再点右上角「发起评测」"
         />
-        <el-table v-else :data="runs" stripe size="small" @row-click="openRunDetail">
+        <el-table v-else :data="runs" stripe size="small" class="eval__runs" @row-click="openRunDetail">
           <el-table-column label="名称" min-width="160">
             <template #default="{ row }">{{ row.name || '未命名运行' }}</template>
           </el-table-column>
@@ -515,10 +515,14 @@ onBeforeUnmount(clearPoll)
   color: var(--da-color-text-secondary);
 }
 
+/* 四个 KPI 并排，数值位数还不同（98.5% 与 1.2s）——用等宽数字让它们
+   在小数点上对齐，扫一眼就能比大小，不必逐个读 */
 .eval__kpi-value {
   font-size: var(--da-font-display);
   font-weight: 600;
   line-height: var(--da-line-height-tight);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
 }
 
 .eval__kpi-hint {
@@ -539,6 +543,13 @@ onBeforeUnmount(clearPoll)
 
 .eval__spacer {
   flex: 1 1 auto;
+}
+
+/* 运行记录点一行会打开详情抽屉，所以要给手型；同一张卡片里的评测集表格
+   点了没有任何反应，**不能**跟着一起给。两个表格在同一个 tab 容器下，
+   靠这一层类名把范围收到运行记录表上。 */
+.eval__runs :deep(.el-table__row) {
+  cursor: pointer;
 }
 
 .eval__trend {

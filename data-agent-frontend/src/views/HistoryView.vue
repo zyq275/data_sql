@@ -230,6 +230,19 @@ onMounted(load)
   padding: var(--da-space-4);
 }
 
+/*
+ * 整行可点（模板上的 `@row-click`），但改造前没有任何"可以点"的提示：
+ * 鼠标划过时和一张普通展示表一模一样，用户不会想到点进去看详情。
+ *
+ * 光标这件事 EP 没有暴露变量，只能落到它的行类名上。**只在这个页面加**，
+ * 不放进 base.css 的全局规则：别处的表格（比如结果预览）点了什么都不会发生，
+ * 全局给手型等于给了一个假的承诺。悬停底色则是全局的，它帮人看清自己停在哪一行，
+ * 和"能不能点"是两件事。
+ */
+.history__body :deep(.el-table__row) {
+  cursor: pointer;
+}
+
 .history__pagination {
   display: flex;
   justify-content: flex-end;
