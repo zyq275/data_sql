@@ -7,10 +7,6 @@
 按角色的表/字段级数据权限治理、批量评测与确定性数据看板，把取数从「天级工单」压缩为
 「秒级对话」。
 
-<p align="center">
-  <img src="docs/images/login-light.png" alt="登录页（浅色）" width="720">
-</p>
-
 ---
 
 ## 目录
@@ -62,10 +58,6 @@
 
 
 **问答页** —— 一句话提问，进度逐节点推送，结果含表格、SQL、解释与图表：
-
-<p align="center">
-  <img src="docs/images/chat.png" alt="智能问答页" width="820">
-</p>
 
 ---
 
@@ -394,7 +386,6 @@ data_sql/
 │   └── tests/                      单元测试与端到端验收
 ├── data-agent-frontend/            前端（Vue 3 / TypeScript / Element Plus）
 │   └── src/                        api / stores / router / views / components / styles
-├── docs/images/                    README 截图
 ├── 数据通达-需求规格说明书（PRD）.md
 ├── 数据通达-技术设计文档（TDD）.md
 ├── 数据通达-开发步骤文档.md
