@@ -36,9 +36,16 @@ import type {
   VizEvent,
 } from '@/api/types'
 import EmptyState from '@/components/EmptyState.vue'
+import LoadingBlock from '@/components/LoadingBlock.vue'
 import ResultViewer from '@/components/ResultViewer.vue'
 import SqlBlock from '@/components/SqlBlock.vue'
+import { clearInflight, markInflight, takeInflight } from '@/utils/inflight'
 import { formatDateTime, nodeLabel, nodeOrder } from '@/utils/labels'
+
+// 被 DefaultLayout 的 keep-alive 保活，而 include 是**按组件名**匹配的。
+// 名字从文件名推出来的那条隐式规则能用，但一旦改名或文件被移动，保活会静默失效
+// （表现为"切页面还是会掐断"），所以这里写死。
+defineOptions({ name: 'ChatView' })
 
 const route = useRoute()
 const router = useRouter()
@@ -261,6 +268,9 @@ async function send() {
     }
 
     controller = new AbortController()
+    // 留痕见 utils/inflight：这一轮要是死在刷新上（上下文销毁，下面的 finally
+    // 跑不到），下次加载就靠它才知道刚才有一轮没跑完
+    markInflight({ conversationId, question: text })
     await streamQuery(
       { query: text, session_id: conversationId },
       {
@@ -300,6 +310,10 @@ async function send() {
       }
     }
   } finally {
+    // 能走到这里就说明页面还活着（成功、报错、用户自己点了停止生成都在内），
+    // 那一轮的去向用户已经看见了，不必在下次加载时再提一次。
+    // 刷新时走不到这里——这正是留痕能当作"死于刷新"判据的原因。
+    clearInflight()
     turn.streaming = false
     streaming.value = false
     controller = null
@@ -330,12 +344,48 @@ function retry(turn: Turn) {
   question.value = turn.question
 }
 
+/**
+ * 刷新把上一轮掐断之后的善后：告诉用户那一轮没了，并给一次重跑的机会。
+ *
+ * 判据与理由见 `utils/inflight`——痕迹在=上次提问死于刷新，痕迹被擦掉=上一轮
+ * 的去向用户已经看见过了（成功、报错、或自己点了停止生成）。
+ *
+ * 提示里必须说清"没有保存"：后端中断时连落库都来不及做（落库在流跑完之后），
+ * 所以历史里查不到这一轮。不说的话，用户会自己去历史里翻，然后怀疑是不是看漏了。
+ */
+async function promptInterrupted() {
+  const lost = takeInflight()
+  if (!lost) {
+    return
+  }
+  const questionText = lost.question.trim()
+  const excerpt = questionText.length > 30 ? `${questionText.slice(0, 30)}…` : questionText
+  try {
+    await ElMessageBox.confirm(
+      `「${excerpt}」在页面刷新时被中断，这一轮没有保存。要用同一个问题重新提问吗？`,
+      '提问已中断',
+      { confirmButtonText: '重新提问', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return // 用户选了"取消"，不是错误
+  }
+  // 不在这里回填 activeId：进这一页之前，框架层已经把路由送到那一轮所在的会话上
+  // （见 DefaultLayout 的 onMounted），`openConversation` 成功的话它早已就位。
+  // 反过来说，若那条会话已被删掉、载入失败，`activeId` 就是 null——此时照着痕迹里的
+  // id 硬填回去，重跑会拿一个不存在的会话去提问，换回一个 404。让它按"新建会话"走，
+  // 至少这次提问能正常发出去。
+  question.value = questionText
+  await send()
+}
+
 onMounted(async () => {
   await loadConversations()
   const id = route.params.conversationId
   if (typeof id === 'string' && id) {
     await openConversation(id)
   }
+  // 放在载入会话之后：提示里的"重新提问"要接着这一轮的上下文发出去
+  await promptInterrupted()
 })
 
 watch(
@@ -347,6 +397,11 @@ watch(
   },
 )
 
+// 卸载才掐断：组件真没了（登出、离开主框架）再留着这条连接，是拿一个已经没人看的
+// 事件流占着后端一个正在跑的图。
+//
+// **切到别的页面不会走到这里**：问答页被 keep-alive 保活（见 DefaultLayout），
+// 切换只是 deactivate，组件和它手里的事件流都还在，回来接着看。
 onBeforeUnmount(abortStreaming)
 </script>
 

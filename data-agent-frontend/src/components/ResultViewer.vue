@@ -9,6 +9,8 @@
 import { computed, ref, watch } from 'vue'
 
 import type { ChartType, ResultSet } from '@/api/types'
+import EChart from '@/components/EChart.vue'
+import EmptyState from '@/components/EmptyState.vue'
 import { buildChartOption, canRenderChart } from '@/utils/chart'
 import { downloadCsv, safeFilename } from '@/utils/csv'
 import { CHART_LABELS } from '@/utils/labels'

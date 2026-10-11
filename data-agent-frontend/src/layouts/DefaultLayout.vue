@@ -20,11 +20,12 @@ import {
   ChatDotRound,
 } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import type { Role } from '@/api/types'
 import { useAuthStore } from '@/stores/auth'
+import { peekInflight } from '@/utils/inflight'
 import { ROLE_LABELS } from '@/utils/role'
 
 interface NavItem {
@@ -38,6 +39,14 @@ interface NavGroup {
   label: string
   items: NavItem[]
 }
+
+/**
+ * 要保活的路由组件名——`keep-alive` 的 include 按**组件名**匹配，不是路由名。
+ *
+ * 只放问答页：它是唯一一个"组件一卸载，正在跑的东西就没了"的页面
+ * （ChatView 的 `onBeforeUnmount` 会掐断正在流的那条连接）。
+ */
+const KEEP_ALIVE = ['ChatView']
 
 const auth = useAuthStore()
 const route = useRoute()
@@ -96,6 +105,28 @@ async function handleLogout() {
   auth.logout()
   await router.replace({ name: 'login' })
 }
+
+onMounted(() => {
+  // 上一次加载要是死在流式中间（刷新把那一轮掐断了），这里把人送回那一轮所在的会话。
+  //
+  // 为什么由框架层来做：提示与"重新提问"都在问答页（那里才有会话与提问框），
+  // 而刷新时用户完全可能停在别的页面（比如提问中切到查询历史再刷新）。
+  // 没有这一步，提示要么弹不出来，要么等到几小时后他随手点进问答页才莫名冒出来。
+  //
+  // 只 `peek`（读而不擦）不 `take`：痕迹要留给问答页去弹提示——这一侧看的时候
+  // 顺手擦掉的话，问答页挂载起来就什么都不剩了。
+  const lost = peekInflight()
+  if (!lost?.conversationId) {
+    return
+  }
+  if (route.params.conversationId === lost.conversationId) {
+    return // 已经停在那条会话上，问答页挂载后会自己弹
+  }
+  void router.replace({
+    name: 'chat-conversation',
+    params: { conversationId: lost.conversationId },
+  })
+})
 
 function handleCommand(command: string) {
   if (command === 'profile') {
@@ -163,7 +194,19 @@ function handleCommand(command: string) {
       </el-header>
 
       <el-main class="layout__main">
-        <router-view />
+        <!--
+          只保活问答页。一轮问答是一条长连接，ChatView 卸载时会主动掐断它
+          （见它的 `onBeforeUnmount(abortStreaming)`）——切到别的页面再回来，
+          那一轮就没了。保活之后切页面只是 deactivate，组件与它手里的事件流都还在。
+
+          其余页面**故意不保活**：它们进页面就重新拉一次数据，缓存一份只会让人
+          看到过期的数字，而"这块数字是刚才那一眼的"在界面上完全看不出来。
+        -->
+        <router-view v-slot="{ Component }">
+          <keep-alive :include="KEEP_ALIVE">
+            <component :is="Component" />
+          </keep-alive>
+        </router-view>
       </el-main>
     </el-container>
   </el-container>

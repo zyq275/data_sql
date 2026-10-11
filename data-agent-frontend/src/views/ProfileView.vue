@@ -2,14 +2,17 @@
 /**
  * 个人设置（FR-AUTH-006）：展示当前用户信息（复用 FR-AUTH-003）、改密（复用 FR-AUTH-004）、登出。
  *
- * 改密成功后**不强制重新登录**：后端改密使旧密码失效，但当前 access token 仍然有效，
- * 把人当场踢出去只会让人怀疑"是不是没改成功"。这里给出明确反馈，让用户自己决定
- * 何时登出。要不要让旧令牌立刻失效属于后端的会话策略，不由前端代劳。
+ * 改密成功后**清掉令牌并直接回登录页**：新密码立刻生效、旧密码作废，而当前这个会话
+ * 是拿旧密码换来的，继续留着用会让人分不清"到底改成功没有"。回登录页用新密码再登一次，
+ * 是对"改成功了"最直接的确认；也让"旧密码登不上"这条验收不用自己找登出按钮就能验。
+ *
+ * 令牌本身是否还有效由后端说了算，这里只是不再拿它继续用。
  */
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { computed, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
+import EmptyState from '@/components/EmptyState.vue'
 import { useAuthStore } from '@/stores/auth'
 import { ROLE_LABELS } from '@/utils/role'
 
@@ -62,11 +65,11 @@ async function submit() {
   submitting.value = true
   try {
     await auth.changePassword(form.oldPassword, form.newPassword)
-    ElMessage.success('密码已修改，请用新密码登录后续会话')
-    form.oldPassword = ''
-    form.newPassword = ''
-    form.confirmPassword = ''
-    formEl.clearValidate()
+    // 提示先弹再跳：ElMessage 挂在 body 上，路由切换不会把它带走。
+    // 反过来的话，人在登录页只会看到一句"密码已修改"却不知道是刚才哪次操作的结果。
+    ElMessage.success('密码已修改，请用新密码重新登录')
+    auth.logout()
+    await router.replace({ name: 'login' })
   } finally {
     submitting.value = false
   }

@@ -75,14 +75,24 @@ function dispatch(payload: Record<string, unknown>, handlers: QueryHandlers): vo
     case 'sql':
       handlers.onSql?.(String(payload.sql ?? ''))
       break
-    case 'result':
+    case 'result': {
+      // **这一个事件的字段嵌在 `data` 里**（TDD 7.3 的 result 行写的就是
+      // `data.columns` / `data.rows`），而 sql / explain / viz 是平铺的。
+      // 它是唯一一个带多个字段的产出事件，后端把它整个包了一层。
+      //
+      // 少这一层解包不会报错：`payload.rows` 是 undefined，落到下面的 `?? []`
+      // 就变成一个空结果集，页面显示"查询成功，但没有匹配的数据"——
+      // 数据其实在，只是谁都没看见。这类"跟着 ?? 默认值一起静默"的错，
+      // 比抛异常难查得多，所以这里把形状差异写明白。
+      const data = (payload.data ?? {}) as Record<string, unknown>
       handlers.onResult?.({
-        columns: (payload.columns as string[]) ?? [],
-        rows: (payload.rows as unknown[][]) ?? [],
-        row_count: Number(payload.row_count ?? 0),
-        truncated: Boolean(payload.truncated),
+        columns: (data.columns as string[]) ?? [],
+        rows: (data.rows as unknown[][]) ?? [],
+        row_count: Number(data.row_count ?? 0),
+        truncated: Boolean(data.truncated),
       })
       break
+    }
     case 'explain':
       handlers.onExplain?.(String(payload.text ?? ''))
       break
